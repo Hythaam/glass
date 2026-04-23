@@ -12,6 +12,9 @@ pub struct FsTool {
 }
 
 impl FsTool {
+    // TODO: consider exposing a `stat_path` helper on the public tools/fs.rs surface
+    // so callers can query metadata (size, is_dir, modified) without reading file contents.
+
     pub fn new(root: PathBuf) -> Result<Self> {
         let root = root
             .canonicalize()
@@ -21,11 +24,16 @@ impl FsTool {
 
     pub fn read_file(&self, input: &str) -> Result<ToolResult> {
         let path = self.resolve(input)?;
-        let body = fs::read_to_string(&path).with_context(|| {
+        // Read raw bytes first so we can return a clearer error when the file isn't valid UTF-8.
+        let bytes = fs::read(&path).with_context(|| {
             format!(
                 "failed to read file '{input}' inside startup directory '{}'",
                 self.root.display()
             )
+        })?;
+
+        let body = String::from_utf8(bytes).map_err(|_| {
+            anyhow!("file '{input}' contains invalid UTF-8; this tool only supports reading text files")
         })?;
 
         let preview = body.lines().next().unwrap_or_default().to_string();
@@ -58,6 +66,10 @@ impl FsTool {
         ))
     }
 
+    // Note: This two-pass approach (resolving an existing prefix and then canonicalizing the final path)
+    // reduces symlink-escape attacks but cannot eliminate a TOCTOU race — the filesystem may change
+    // between checks. For a read-only tool that's scoped to a startup directory, this risk is acceptable
+    // because we never write and we additionally verify the canonicalized final path stays inside root.
     fn resolve(&self, input: &str) -> Result<PathBuf> {
         let relative = self.normalize_relative_path(input)?;
         let candidate = self.root.join(&relative);
@@ -180,6 +192,14 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    /// RAII guard to ensure test directories are removed even if a test panics.
+    struct TestDirGuard(PathBuf);
+    impl Drop for TestDirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     #[test]
     fn rejects_escape_outside_root() {
         let tool = FsTool::new(std::env::current_dir().unwrap()).unwrap();
@@ -199,6 +219,7 @@ mod tests {
         let root = test_root("read");
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
+        let _guard = TestDirGuard(root.clone());
         fs::write(root.join("note.txt"), "hello\nworld").unwrap();
 
         let tool = FsTool::new(root.clone()).unwrap();
@@ -210,8 +231,6 @@ mod tests {
                 assert_eq!(body, "hello\nworld");
             }
         }
-
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -219,14 +238,13 @@ mod tests {
         let root = test_root("list");
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("nested")).unwrap();
+        let _guard = TestDirGuard(root.clone());
         fs::write(root.join("nested").join("file.txt"), "hello").unwrap();
 
         let tool = FsTool::new(root.clone()).unwrap();
         let result = tool.list_dir("nested").unwrap();
         let body = text_body(&result);
         assert!(body.contains("file.txt"));
-
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -238,15 +256,14 @@ mod tests {
         let _ = fs::remove_dir_all(&outside);
         fs::create_dir_all(&root).unwrap();
         fs::create_dir_all(&outside).unwrap();
+        let _root_guard = TestDirGuard(root.clone());
+        let _outside_guard = TestDirGuard(outside.clone());
         fs::write(outside.join("secret.txt"), "secret").unwrap();
         std::os::unix::fs::symlink(outside.join("secret.txt"), root.join("escape.txt")).unwrap();
 
         let tool = FsTool::new(root.clone()).unwrap();
         let error = tool.read_file("escape.txt").unwrap_err().to_string();
         assert!(error.contains("startup directory"));
-
-        let _ = fs::remove_dir_all(root);
-        let _ = fs::remove_dir_all(outside);
     }
 
     #[test]
@@ -254,13 +271,12 @@ mod tests {
         let root = test_root("missing-file");
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
+        let _guard = TestDirGuard(root.clone());
 
         let tool = FsTool::new(root.clone()).unwrap();
         let error = tool.read_file("missing.txt").unwrap_err().to_string();
         assert!(error.contains("failed to read file 'missing.txt'"));
         assert!(error.contains("startup directory"));
-
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -268,13 +284,12 @@ mod tests {
         let root = test_root("missing-dir");
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
+        let _guard = TestDirGuard(root.clone());
 
         let tool = FsTool::new(root.clone()).unwrap();
         let error = tool.list_dir("missing").unwrap_err().to_string();
         assert!(error.contains("failed to list directory 'missing'"));
         assert!(error.contains("startup directory"));
-
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -282,14 +297,13 @@ mod tests {
         let root = test_root("list-file");
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
+        let _guard = TestDirGuard(root.clone());
         fs::write(root.join("note.txt"), "hello").unwrap();
 
         let tool = FsTool::new(root.clone()).unwrap();
         let error = tool.list_dir("note.txt").unwrap_err().to_string();
         assert!(error.contains("failed to list directory 'note.txt'"));
         assert!(error.contains("startup directory"));
-
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -305,6 +319,7 @@ mod tests {
         let root = test_root("symlink-in-root");
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("nested")).unwrap();
+        let _guard = TestDirGuard(root.clone());
         fs::write(root.join("nested").join("file.txt"), "hello").unwrap();
         std::os::unix::fs::symlink(
             root.join("nested").join("file.txt"),
@@ -321,8 +336,6 @@ mod tests {
                 assert_eq!(body, "hello");
             }
         }
-
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -330,13 +343,12 @@ mod tests {
         let root = test_root("read-dir");
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("nested")).unwrap();
+        let _guard = TestDirGuard(root.clone());
 
         let tool = FsTool::new(root.clone()).unwrap();
         let error = tool.read_file("nested").unwrap_err().to_string();
         assert!(error.contains("failed to read file 'nested'"));
         assert!(error.contains("startup directory"));
-
-        let _ = fs::remove_dir_all(root);
     }
 
     fn text_body(result: &ToolResult) -> &str {

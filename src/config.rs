@@ -12,7 +12,6 @@ const OLLAMA_URL_ENV: &str = "GLASS_OLLAMA_URL";
 const CONTEXT_LIMIT_TOKENS_ENV: &str = "GLASS_CONTEXT_LIMIT_TOKENS";
 const CONFIG_FILE_RELATIVE_PATH: &str = ".config/glass/config.toml";
 
-
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct CliConfig {
     pub ollama_url: Option<String>,
@@ -224,13 +223,17 @@ fn default_config_path() -> Option<PathBuf> {
     env::var_os("HOME").map(|home| PathBuf::from(home).join(CONFIG_FILE_RELATIVE_PATH))
 }
 
-fn deserialize_option_context_limit<'de, D>(deserializer: D) -> std::result::Result<Option<usize>, D::Error>
+fn deserialize_option_context_limit<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<usize>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     let opt = Option::<usize>::deserialize(deserializer)?;
     if let Some(0) = opt {
-        return Err(serde::de::Error::custom("context_limit_tokens must be a positive integer greater than zero"));
+        return Err(serde::de::Error::custom(
+            "context_limit_tokens must be a positive integer greater than zero",
+        ));
     }
     Ok(opt)
 }
@@ -404,16 +407,23 @@ context_limit_tokens = 0
 
     #[test]
     fn missing_ollama_url_is_error() {
-        let error = Config::from_sources(CliConfig::default(), EnvConfig::default(), FileConfig::default())
-            .unwrap_err()
-            .to_string();
+        let error = Config::from_sources(
+            CliConfig::default(),
+            EnvConfig::default(),
+            FileConfig::default(),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(error.contains("ollama_url"));
     }
 
     #[test]
     fn missing_context_limit_tokens_is_error() {
         let error = Config::from_sources(
-            CliConfig { ollama_url: Some("http://cli:11434".into()), context_limit_tokens: None },
+            CliConfig {
+                ollama_url: Some("http://cli:11434".into()),
+                context_limit_tokens: None,
+            },
             EnvConfig::default(),
             FileConfig::default(),
         )
