@@ -4,10 +4,28 @@ pub struct Turn {
     content: String,
 }
 
+impl Turn {
+    pub fn role(&self) -> &'static str {
+        self.role
+    }
+    pub fn content(&self) -> &str {
+        &self.content
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolObservation {
     tool_name: String,
     body: String,
+}
+
+impl ToolObservation {
+    pub fn tool_name(&self) -> &str {
+        &self.tool_name
+    }
+    pub fn body(&self) -> &str {
+        &self.body
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -16,6 +34,25 @@ pub struct SessionContext {
     summary: Option<String>,
     recent_turns: Vec<Turn>,
     tool_observations: Vec<ToolObservation>,
+}
+
+impl SessionContext {
+    /// Read-only accessor for configured token limit.
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+    /// Read-only accessor for the optional summary (if any).
+    pub fn summary(&self) -> Option<&str> {
+        self.summary.as_deref()
+    }
+    /// Read-only slice of recent turns.
+    pub fn recent_turns(&self) -> &[Turn] {
+        &self.recent_turns
+    }
+    /// Read-only slice of tool observations.
+    pub fn tool_observations(&self) -> &[ToolObservation] {
+        &self.tool_observations
+    }
 }
 
 const TURN_OVERHEAD_TOKENS: usize = 12;
@@ -52,7 +89,9 @@ impl SessionContext {
             body: body.into(),
         });
         // Enforce recent-only raw retention: compact older tool outputs immediately
-        // so only the most recent RAW_TOOL_WINDOW remain un-compacted.
+        // so only the most recent RAW_TOOL_WINDOW remain as full raw bodies.
+        // compact_old_tool_outputs() is safe to call repeatedly and is intentionally
+        // idempotent for already-compacted entries.
         self.compact_old_tool_outputs();
     }
 
@@ -72,9 +111,10 @@ impl SessionContext {
             self.append_turn_summary(removed);
         }
 
-        // NOTE: the second call to prune_old_tool_observations() here was redundant
-        // because we already pruned tools above and removing turns reduces token
-        // usage. Removing the duplicate call to avoid double-side effects.
+        // NOTE: a previous implementation made an extra call to prune_old_tool_observations().
+        // That duplicate was removed because removing turns and compacting the summary
+        // also reduces token usage. We use compact_summary() here to further shrink
+        // the summary if needed.
         while self.estimated_tokens() > self.limit && self.compact_summary() {}
     }
 
@@ -111,6 +151,8 @@ impl SessionContext {
         // Compact older tool outputs so they no longer keep their full bodies in
         // memory. Keep a small recent window of full bodies (RAW_TOOL_WINDOW)
         // and replace older observations with a compacted summary.
+        // Safe to call multiple times; already-compacted bodies are recognized
+        // and not re-compacted (idempotent behavior).
         let n = self.tool_observations.len();
         if n == 0 {
             return;
@@ -329,6 +371,17 @@ mod tests {
     }
 
     #[test]
+    fn single_large_turn_may_exceed_budget() {
+        let mut ctx = SessionContext::new(5);
+        // Push a single very long turn so its estimated tokens exceed the limit.
+        ctx.push_user("a very very very very very very very long message meant to be large");
+        ctx.prune_if_needed();
+        // The single remaining turn is intentionally retained even if it exceeds the limit.
+        assert_eq!(ctx.recent_turns().len(), 1);
+        assert!(ctx.estimated_tokens() > ctx.limit());
+    }
+
+    #[test]
     fn prune_if_needed_brings_context_within_budget() {
         let mut context = SessionContext::new(20);
         context.push_user("one two three four five six seven eight");
@@ -382,7 +435,7 @@ mod tests {
             }
         }
 
-        // Second compaction pass should be idempotent (no double-prefixing)
+        // Second compaction pass should be safe: it must not add extra 'summary:' prefixes
         ctx.compact_old_tool_outputs();
         if n > keep {
             for i in 0..(n - keep) {
