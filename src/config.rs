@@ -166,6 +166,12 @@ impl Config {
 fn validate_ollama_url(raw: &str) -> Result<Url> {
     let url = Url::parse(raw).map_err(|e| anyhow!("ollama_url must be a full base URL: {e}"))?;
 
+    // Require http or https scheme because Ollama speaks HTTP
+    match url.scheme() {
+        "http" | "https" => {}
+        _ => bail!("ollama_url must use http or https scheme"),
+    }
+
     if url.host_str().is_none() || url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
         bail!("ollama_url must be a full base URL");
     }
@@ -257,6 +263,19 @@ mod tests {
             "glass",
             "--ollama-url",
             "http://cli:11434",
+            "--context-limit-tokens=8192",
+        ])
+        .unwrap();
+
+        assert_eq!(cli.ollama_url.as_deref(), Some("http://cli:11434"));
+        assert_eq!(cli.context_limit_tokens, Some(8192));
+    }
+
+    #[test]
+    fn parses_cli_equals_form_ollama_url() {
+        let cli = CliConfig::from_args([
+            "glass",
+            "--ollama-url=http://cli:11434",
             "--context-limit-tokens=8192",
         ])
         .unwrap();
