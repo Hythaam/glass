@@ -1,21 +1,21 @@
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Turn {
-    pub role: &'static str,
-    pub content: String,
+    role: &'static str,
+    content: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolObservation {
-    pub tool_name: String,
-    pub body: String,
+    tool_name: String,
+    body: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionContext {
-    pub limit: usize,
-    pub summary: Option<String>,
-    pub recent_turns: Vec<Turn>,
-    pub tool_observations: Vec<ToolObservation>,
+    limit: usize,
+    summary: Option<String>,
+    recent_turns: Vec<Turn>,
+    tool_observations: Vec<ToolObservation>,
 }
 
 const TURN_OVERHEAD_TOKENS: usize = 12;
@@ -64,12 +64,17 @@ impl SessionContext {
         self.compact_old_tool_outputs();
         self.prune_old_tool_observations();
 
+        // Intentionally keep at least one recent turn (e.g. the final user message)
+        // so that the agent still has context to answer. Only prune older turns
+        // when there is more than one turn available.
         while self.estimated_tokens() > self.limit && self.recent_turns.len() > 1 {
             let removed = self.recent_turns.remove(0);
             self.append_turn_summary(removed);
         }
 
-        self.prune_old_tool_observations();
+        // NOTE: the second call to prune_old_tool_observations() here was redundant
+        // because we already pruned tools above and removing turns reduces token
+        // usage. Removing the duplicate call to avoid double-side effects.
         while self.estimated_tokens() > self.limit && self.compact_summary() {}
     }
 
@@ -179,6 +184,12 @@ fn estimate_text_tokens(text: &str) -> usize {
 }
 
 fn summarize_tool_body(body: &str) -> String {
+    // Avoid double-summarization: if the body already looks like a compacted
+    // summary we should return it as-is to keep compaction idempotent.
+    if body.trim_start().starts_with("summary:") {
+        return body.to_string();
+    }
+
     let preview = body
         .lines()
         .filter(|line| !line.trim().is_empty())
@@ -348,5 +359,36 @@ mod tests {
         assert!(context.estimated_tokens() <= context.limit);
         assert_eq!(context.tool_observations.len(), 1);
         assert_eq!(context.tool_observations[0].tool_name, "stat");
+    }
+
+    #[test]
+    fn compacts_tool_bodies_idempotently_with_many_observations() {
+        let mut ctx = SessionContext::new(1000);
+        ctx.push_tool_output("t1", "one\ntwo\nthree\nfour");
+        ctx.push_tool_output("t2", "a\nb\nc\nd");
+        ctx.push_tool_output("t3", "alpha\nbeta\ngamma\ndelta");
+        ctx.push_tool_output("t4", "recent\nraw\noutput");
+
+        // First compaction pass
+        ctx.compact_old_tool_outputs();
+
+        let n = ctx.tool_observations.len();
+        let keep = RAW_TOOL_WINDOW.min(n);
+        if n > keep {
+            for i in 0..(n - keep) {
+                let b = &ctx.tool_observations[i].body;
+                assert!(b.starts_with("summary:") || !b.is_empty());
+                assert!(!b.contains("summary: summary:"), "double summary at idx {}", i);
+            }
+        }
+
+        // Second compaction pass should be idempotent (no double-prefixing)
+        ctx.compact_old_tool_outputs();
+        if n > keep {
+            for i in 0..(n - keep) {
+                let b = &ctx.tool_observations[i].body;
+                assert!(!b.contains("summary: summary:"), "double summary after second compaction at idx {}", i);
+            }
+        }
     }
 }
