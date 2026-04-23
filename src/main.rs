@@ -1,6 +1,5 @@
 mod agent;
 
-#[allow(dead_code)]
 mod config;
 #[allow(dead_code)]
 mod context;
@@ -19,6 +18,9 @@ fn main() {
 }
 
 fn run() -> anyhow::Result<()> {
+    // Load config to validate startup settings at startup. `_config` is unused for now
+    // but will be consumed by features added later; keeping this load ensures early
+    // validation of CLI/env/config values.
     let _config = config::Config::load(std::env::args_os())?;
     Ok(())
 }

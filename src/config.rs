@@ -11,7 +11,7 @@ const CONTEXT_LIMIT_TOKENS_FLAG: &str = "--context-limit-tokens";
 const OLLAMA_URL_ENV: &str = "GLASS_OLLAMA_URL";
 const CONTEXT_LIMIT_TOKENS_ENV: &str = "GLASS_CONTEXT_LIMIT_TOKENS";
 const CONFIG_FILE_RELATIVE_PATH: &str = ".config/glass/config.toml";
-const MIN_CONTEXT_LIMIT_TOKENS: usize = 1;
+
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct CliConfig {
@@ -147,15 +147,15 @@ impl Config {
             .ollama_url
             .or(env.ollama_url)
             .or(file.ollama_url)
-            .ok_or_else(|| anyhow!("ollama_url is required"))?;
+            .ok_or_else(|| anyhow!("ollama_url is required; provide via --ollama-url, GLASS_OLLAMA_URL, or config file"))?;
         let context_limit_tokens = cli
             .context_limit_tokens
             .or(env.context_limit_tokens)
             .or(file.context_limit_tokens)
-            .ok_or_else(|| anyhow!("context_limit_tokens is required"))?;
+            .ok_or_else(|| anyhow!("context_limit_tokens is required; provide via --context-limit-tokens, GLASS_CONTEXT_LIMIT_TOKENS, or config file"))?;
 
-        if context_limit_tokens < MIN_CONTEXT_LIMIT_TOKENS {
-            bail!("context_limit_tokens must be a positive integer");
+        if context_limit_tokens == 0 {
+            bail!("context_limit_tokens must be greater than zero; provide via --context-limit-tokens, GLASS_CONTEXT_LIMIT_TOKENS, or config file");
         }
 
         Ok(Self {
@@ -168,11 +168,7 @@ impl Config {
 fn validate_ollama_url(raw: &str) -> Result<Url> {
     let url = Url::parse(raw).map_err(|_| anyhow!("ollama_url must be a full base URL"))?;
 
-    if url.host_str().is_none()
-        || (!url.path().is_empty() && url.path() != "/")
-        || url.query().is_some()
-        || url.fragment().is_some()
-    {
+    if url.host_str().is_none() || url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
         bail!("ollama_url must be a full base URL");
     }
 
@@ -295,5 +291,23 @@ context_limit_tokens = 2048
         .to_string();
 
         assert!(error.contains("context_limit_tokens"));
+    }
+
+    #[test]
+    fn missing_config_file_returns_default() {
+        let file = FileConfig::from_path("does-not-exist-config.toml").unwrap();
+        assert_eq!(file, FileConfig::default());
+    }
+
+    #[test]
+    fn rejects_unknown_toml_fields() {
+        let res = FileConfig::from_toml_str(r#"unknown = 1"#);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn parses_cli_space_separated_context_limit() {
+        let cli = CliConfig::from_args(["glass", "--context-limit-tokens", "8192"]).unwrap();
+        assert_eq!(cli.context_limit_tokens, Some(8192));
     }
 }
