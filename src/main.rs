@@ -11,7 +11,17 @@ mod tools;
 #[allow(dead_code)]
 mod tui;
 
-fn main() {}
+fn main() {
+    if let Err(error) = run() {
+        eprintln!("{error:#}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> anyhow::Result<()> {
+    let _config = config::Config::load(std::env::args_os())?;
+    Ok(())
+}
 
 #[cfg(test)]
 fn assert_module_smoke() {
@@ -35,4 +45,3 @@ fn assert_module_smoke() {
 fn module_smoke_test() {
     assert_module_smoke();
 }
-
