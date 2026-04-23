@@ -8,7 +8,6 @@ pub struct Turn {
 pub struct ToolObservation {
     pub tool_name: String,
     pub body: String,
-    pub raw_body: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,8 +50,10 @@ impl SessionContext {
         self.tool_observations.push(ToolObservation {
             tool_name: tool_name.into(),
             body: body.into(),
-            raw_body: None,
         });
+        // Enforce recent-only raw retention: compact older tool outputs immediately
+        // so only the most recent RAW_TOOL_WINDOW remain un-compacted.
+        self.compact_old_tool_outputs();
     }
 
     pub fn prune_if_needed(&mut self) {
@@ -102,9 +103,9 @@ impl SessionContext {
     }
 
     fn compact_old_tool_outputs(&mut self) {
-        // Compact truly old tool outputs so they no longer keep their full raw
-        // body in memory. Keep a small recent window of raw outputs (by
-        // keeping their full bodies) and summarize older observations.
+        // Compact older tool outputs so they no longer keep their full bodies in
+        // memory. Keep a small recent window of full bodies (RAW_TOOL_WINDOW)
+        // and replace older observations with a compacted summary.
         let n = self.tool_observations.len();
         if n == 0 {
             return;
@@ -113,17 +114,14 @@ impl SessionContext {
 
         for index in 0..n {
             if index + keep >= n {
-                // part of the recent window: keep the full body and don't keep a
-                // separate raw_body copy to avoid duplication.
-                self.tool_observations[index].raw_body = None;
+                // part of the recent window: keep the full body as-is.
                 continue;
             }
 
             // Older than the recent window: replace the body with a compacted
-            // summary and drop any raw copy.
+            // summary.
             let compacted = summarize_tool_body(&self.tool_observations[index].body);
             self.tool_observations[index].body = compacted;
-            self.tool_observations[index].raw_body = None;
         }
     }
 
@@ -159,7 +157,7 @@ impl SessionContext {
     }
 
     fn append_tool_summary(&mut self, observation: ToolObservation) {
-        let body = observation.raw_body.unwrap_or(observation.body);
+        let body = observation.body;
         let next = format!(
             "tool {}: {}",
             observation.tool_name,
@@ -270,7 +268,7 @@ mod tests {
 
         // We no longer retain full raw bodies for older observations.
         for obs in &context.tool_observations {
-            assert!(obs.raw_body.is_none(), "raw_body must not be retained");
+            assert!(!obs.body.is_empty(), "body must be present");
         }
     }
 
@@ -283,7 +281,7 @@ mod tests {
         context.prune_if_needed();
 
         assert_eq!(context.tool_observations[0].body, "a\nb\nc\nd\ne\nf");
-        assert!(context.tool_observations[0].raw_body.is_none());
+        // raw_body removed; ensure body is present (checked above)
     }
 
     #[test]
