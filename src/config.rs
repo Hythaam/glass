@@ -29,6 +29,9 @@ impl CliConfig {
         let mut args = args.into_iter().map(Into::into);
         let _program = args.next();
 
+        // Note: Unknown-argument behavior currently bails with an error. If we later add
+        // positional arguments or broader CLI handling, revisit this behavior to allow
+        // positional parsing or graceful ignoring of unknown flags.  -- TODO
         while let Some(raw_arg) = args.next() {
             let arg = os_string_to_string(raw_arg, "CLI arguments")?;
             match arg.as_str() {
@@ -257,7 +260,38 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invalid_url() {
+    fn env_over_file_when_cli_absent() {
+        let file = FileConfig {
+            ollama_url: Some("http://file:11434".into()),
+            context_limit_tokens: Some(2048),
+        };
+        let env = EnvConfig {
+            ollama_url: Some("http://env:11434".into()),
+            context_limit_tokens: Some(4096),
+        };
+        let cli = CliConfig::default();
+
+        let config = Config::from_sources(cli, env, file).unwrap();
+        assert_eq!(config.ollama_url.as_str(), "http://env:11434/");
+        assert_eq!(config.context_limit_tokens, 4096);
+    }
+
+    #[test]
+    fn file_used_when_cli_and_env_absent() {
+        let file = FileConfig {
+            ollama_url: Some("http://file:11434".into()),
+            context_limit_tokens: Some(2048),
+        };
+        let env = EnvConfig::default();
+        let cli = CliConfig::default();
+
+        let config = Config::from_sources(cli, env, file).unwrap();
+        assert_eq!(config.ollama_url.as_str(), "http://file:11434/");
+        assert_eq!(config.context_limit_tokens, 2048);
+    }
+
+    #[test]
+    fn rejects_non_full_url() {
         let cli = CliConfig {
             ollama_url: Some("localhost:11434".into()),
             context_limit_tokens: Some(4096),
