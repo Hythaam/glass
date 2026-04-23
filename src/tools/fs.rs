@@ -6,14 +6,14 @@ use std::path::{Component, Path, PathBuf};
 
 use super::ToolResult;
 
+// TODO: consider exposing a `stat_path` helper on the public tools/fs.rs surface
+// so callers can query metadata (size, is_dir, modified) without reading file contents.
 #[derive(Debug, Clone)]
 pub struct FsTool {
     root: PathBuf,
 }
 
 impl FsTool {
-    // TODO: consider exposing a `stat_path` helper on the public tools/fs.rs surface
-    // so callers can query metadata (size, is_dir, modified) without reading file contents.
 
     pub fn new(root: PathBuf) -> Result<Self> {
         let root = root
@@ -98,7 +98,7 @@ impl FsTool {
                 }
                 Ok(final_path)
             }
-            Err(error) if error.kind() == ErrorKind::NotFound => Ok(candidate),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(resolved),
             Err(error) => Err(error).with_context(|| {
                 format!(
                     "failed to inspect '{input}' inside startup directory '{}'",
@@ -109,6 +109,13 @@ impl FsTool {
     }
 
     fn normalize_relative_path(&self, input: &str) -> Result<PathBuf> {
+        if input.is_empty() {
+            return Err(anyhow!(
+                "path is empty; provide a file or directory path inside the startup directory '{}'",
+                self.root.display()
+            ));
+        }
+
         let path = Path::new(input);
         if path.is_absolute() {
             return Err(anyhow!(
