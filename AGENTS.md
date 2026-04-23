@@ -38,16 +38,15 @@ coding_agent/
 ├── agent.rs             # Core loop: plan -> act -> observe -> repeat
 ├── tools/
 │   ├── mod.rs           # Tool trait + dispatch registry
-│   ├── shell.rs         # Run shell commands inside the startup directory
 │   └── fs.rs            # File operations inside the startup directory
 ├── llm/
 │   ├── mod.rs           # Provider interface
 │   └── ollama.rs        # Ollama implementation for v1
 ├── context.rs           # In-memory session history and pruning
-└── config.rs            # CLI/env/config-file loading for Ollama server address
+└── config.rs            # CLI/env/config-file loading for Ollama settings
 ```
 
-Remove the dedicated search tool from v1. Directory inspection should happen through `shell` and `fs`.
+Remove the dedicated search tool from v1. Directory inspection should happen through `fs`.
 
 If the current crate still contains `tools/search.rs`, remove it from the v1 path.  
 If the current crate still contains `llm/openai.rs`, rename or replace it so the crate reflects the actual Ollama-only v1 scope.
@@ -55,7 +54,7 @@ If the current crate still contains `llm/openai.rs`, rename or replace it so the
 ## Runtime model
 
 1. Start from the current working directory. The startup directory is the tool root even when it is a subdirectory of a Git repo or not a Git repo at all.
-2. Load the single v1 config value: the Ollama server address.
+2. Load the v1 config values: the Ollama server address and the context pruning limit.
 3. Start one in-memory chat session.
 4. Accept user input in the TUI.
 5. Send session context to the Ollama backend.
@@ -96,20 +95,9 @@ If the current crate still contains `llm/openai.rs`, rename or replace it so the
 ### `tools/mod.rs`
 
 - Define the common tool interface and registry.
-- v1 tools are only `shell` and `fs`.
+- v1 tools are only `fs`.
 - Tool results must be structured enough for both the agent and the TUI.
 - Tool errors must include actionable context.
-
-### `tools/shell.rs`
-
-- Execute commands from the startup directory only.
-- Validate startup-directory-relative paths before execution where applicable.
-- Capture exit status, stdout, and stderr.
-- Stream command output when possible.
-- v1 shell access is read-only; commands that would mutate files or version-control state are rejected before execution.
-- Invoke `/bin/sh -lc` on both Linux and macOS.
-- Inherit the parent process environment unchanged.
-- Use a default timeout of 60 seconds and allow user-triggered cancellation.
 
 ### `tools/fs.rs`
 
@@ -140,7 +128,8 @@ If the current crate still contains `llm/openai.rs`, rename or replace it so the
 - Hold in-memory conversation history for the active session only.
 - Store tool observations needed for the current run.
 - Never persist session data to disk in v1.
-- When context approaches the model limit, summarize the oldest conversation into a compact internal summary while keeping recent raw turns.
+- Use a configurable approximate token limit to decide when pruning begins.
+- When estimated context approaches that limit, summarize the oldest conversation into a compact internal summary while keeping recent raw turns.
 - Retain raw tool output only for recent tool calls needed by the active conversation; summarize older tool observations before pruning them.
 
 ### `config.rs`
@@ -149,13 +138,17 @@ If the current crate still contains `llm/openai.rs`, rename or replace it so the
   - CLI flags
   - environment variables
   - `~/.config/glass/config.toml`
-- The only v1 config value is the Ollama server address.
+- The v1 config values are the Ollama server address and the context pruning limit.
 - Validate config at startup and fail fast with a clear error.
 - Use the CLI flag name `--ollama-url`.
 - Use the environment variable name `GLASS_OLLAMA_URL`.
 - Use the TOML key `ollama_url`.
+- Use the CLI flag name `--context-limit-tokens`.
+- Use the environment variable name `GLASS_CONTEXT_LIMIT_TOKENS`.
+- Use the TOML key `context_limit_tokens`.
 - Apply precedence in the order CLI flag > environment variable > config file.
 - Require the value to be a full base URL, including scheme and port when needed.
+- Treat the context limit as an approximate token budget for pruning rather than an exact tokenizer guarantee.
 
 ## Startup directory boundary rules
 
@@ -172,13 +165,14 @@ If the current crate still contains `llm/openai.rs`, rename or replace it so the
 - Keep TUI code isolated so headless mode can be added later without rewriting the agent loop.
 - Use a single scrolling transcript pane with a bottom input composer; show tool activity and tool output inline in the transcript.
 - Use `Enter` to send, `Shift+Enter` to insert a newline, `PageUp`/`PageDown` to scroll the transcript, and `Ctrl+C` to quit.
-- Fold long tool output inline behind a short preview and allow it to be expanded in place; do not add a separate pager in v1.
+- Fold long tool output inline behind a short preview and allow it to be expanded and collapsed in place on mouse click; do not add a separate pager in v1.
 
 ## Testing
 
 - Unit tests only in v1.
 - Prioritize tests for pure logic:
   - config parsing and validation
+  - configured context-limit pruning behavior
   - startup-directory boundary checks
   - path normalization
   - provider request and response parsing
