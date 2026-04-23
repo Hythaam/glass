@@ -21,6 +21,7 @@ pub struct SessionContext {
 
 const TURN_OVERHEAD_TOKENS: usize = 12;
 const TOOL_OBSERVATION_OVERHEAD_TOKENS: usize = 12;
+const RAW_TOOL_WINDOW: usize = 2;
 
 impl SessionContext {
     pub fn new(limit: usize) -> Self {
@@ -101,24 +102,28 @@ impl SessionContext {
     }
 
     fn compact_old_tool_outputs(&mut self) {
-        let last_index = self.tool_observations.len().saturating_sub(1);
-        for index in 0..self.tool_observations.len() {
-            if !self.should_prune() {
-                return;
-            }
-            if index == last_index {
-                break;
-            }
-            if self.tool_observations[index].raw_body.is_some() {
+        // Compact truly old tool outputs so they no longer keep their full raw
+        // body in memory. Keep a small recent window of raw outputs (by
+        // keeping their full bodies) and summarize older observations.
+        let n = self.tool_observations.len();
+        if n == 0 {
+            return;
+        }
+        let keep = RAW_TOOL_WINDOW.min(n);
+
+        for index in 0..n {
+            if index + keep >= n {
+                // part of the recent window: keep the full body and don't keep a
+                // separate raw_body copy to avoid duplication.
+                self.tool_observations[index].raw_body = None;
                 continue;
             }
 
+            // Older than the recent window: replace the body with a compacted
+            // summary and drop any raw copy.
             let compacted = summarize_tool_body(&self.tool_observations[index].body);
-            if compacted != self.tool_observations[index].body {
-                self.tool_observations[index].raw_body =
-                    Some(self.tool_observations[index].body.clone());
-                self.tool_observations[index].body = compacted;
-            }
+            self.tool_observations[index].body = compacted;
+            self.tool_observations[index].raw_body = None;
         }
     }
 
@@ -263,10 +268,10 @@ mod tests {
 
         context.prune_if_needed();
 
-        assert_eq!(
-            context.tool_observations[0].raw_body.as_deref(),
-            Some("alpha\nbeta\ngamma\ndelta\nepsilon\nzeta")
-        );
+        // We no longer retain full raw bodies for older observations.
+        for obs in &context.tool_observations {
+            assert!(obs.raw_body.is_none(), "raw_body must not be retained");
+        }
     }
 
     #[test]
