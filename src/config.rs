@@ -96,6 +96,7 @@ impl EnvConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct FileConfig {
     pub ollama_url: Option<String>,
+    #[serde(deserialize_with = "deserialize_option_context_limit")]
     pub context_limit_tokens: Option<usize>,
 }
 
@@ -124,6 +125,7 @@ impl FileConfig {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct Config {
     pub ollama_url: Url,
@@ -153,10 +155,6 @@ impl Config {
             .or(env.context_limit_tokens)
             .or(file.context_limit_tokens)
             .ok_or_else(|| anyhow!("context_limit_tokens is required; provide via --context-limit-tokens, GLASS_CONTEXT_LIMIT_TOKENS, or config file"))?;
-
-        if context_limit_tokens == 0 {
-            bail!("context_limit_tokens must be greater than zero; provide via --context-limit-tokens, GLASS_CONTEXT_LIMIT_TOKENS, or config file");
-        }
 
         Ok(Self {
             ollama_url: validate_ollama_url(&ollama_url)?,
@@ -192,12 +190,28 @@ fn os_string_to_string(value: OsString, label: &str) -> Result<String> {
 }
 
 fn parse_context_limit(raw: &str, source: &str) -> Result<usize> {
-    raw.parse::<usize>()
-        .with_context(|| format!("{source} must be a positive integer"))
+    let value = raw
+        .parse::<usize>()
+        .with_context(|| format!("{source} must be a positive integer"))?;
+    if value == 0 {
+        bail!("{source} must be a positive integer greater than zero");
+    }
+    Ok(value)
 }
 
 fn default_config_path() -> Option<PathBuf> {
     env::var_os("HOME").map(|home| PathBuf::from(home).join(CONFIG_FILE_RELATIVE_PATH))
+}
+
+fn deserialize_option_context_limit<'de, D>(deserializer: D) -> std::result::Result<Option<usize>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt = Option::<usize>::deserialize(deserializer)?;
+    if let Some(0) = opt {
+        return Err(serde::de::Error::custom("context_limit_tokens must be a positive integer greater than zero"));
+    }
+    Ok(opt)
 }
 
 #[cfg(test)]
@@ -278,19 +292,25 @@ context_limit_tokens = 2048
     }
 
     #[test]
-    fn rejects_small_context_limit() {
-        let error = Config::from_sources(
-            CliConfig {
-                ollama_url: Some("http://cli:11434".into()),
-                context_limit_tokens: Some(0),
-            },
-            EnvConfig::default(),
-            FileConfig::default(),
-        )
-        .unwrap_err()
-        .to_string();
+    fn rejects_zero_context_limit() {
+        let res = CliConfig::from_args([
+            "glass",
+            "--ollama-url",
+            "http://cli:11434",
+            "--context-limit-tokens",
+            "0",
+        ]);
+        assert!(res.is_err());
+        let err = res.unwrap_err().to_string();
+        assert!(err.contains("context_limit_tokens") || err.contains("positive"));
+    }
 
-        assert!(error.contains("context_limit_tokens"));
+    #[test]
+    fn missing_ollama_url_is_error() {
+        let error = Config::from_sources(CliConfig::default(), EnvConfig::default(), FileConfig::default())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("ollama_url"));
     }
 
     #[test]
