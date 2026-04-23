@@ -6,8 +6,10 @@ use std::path::{Component, Path, PathBuf};
 
 use super::ToolResult;
 
-// TODO: consider exposing a `stat_path` helper on the public tools/fs.rs surface
-// so callers can query metadata (size, is_dir, modified) without reading file contents.
+// TODO (deferred from Task 3): expose a `stat_path` helper on the public tools/fs.rs surface
+// This helper should let callers query path metadata (size, is_dir, modified) without
+// reading full file contents. Implementing stat_path was intentionally deferred from Task 3
+// and is required before later tool-dispatch work that needs lightweight metadata checks.
 #[derive(Debug, Clone)]
 pub struct FsTool {
     root: PathBuf,
@@ -70,6 +72,13 @@ impl FsTool {
     // reduces symlink-escape attacks but cannot eliminate a TOCTOU race — the filesystem may change
     // between checks. For a read-only tool that's scoped to a startup directory, this risk is acceptable
     // because we never write and we additionally verify the canonicalized final path stays inside root.
+    // Important: the second canonicalize() call after confirming the candidate exists is intentional and
+    // must not be removed. It ensures any symlinks on the final path are resolved and produces a canonical
+    // absolute target that we re-check against self.root. Without this final canonicalize, a symlink could be
+    // swapped between the earlier prefix resolution and the final existence check, allowing the tool to return
+    // a path that actually points outside the startup directory. While this does not eliminate TOCTOU races,
+    // keeping the final canonicalize materially reduces the attack surface by verifying the resolved target
+    // immediately before returning.
     fn resolve(&self, input: &str) -> Result<PathBuf> {
         let relative = self.normalize_relative_path(input)?;
         let candidate = self.root.join(&relative);
