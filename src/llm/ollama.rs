@@ -111,9 +111,6 @@ pub fn parse_chat_chunk(input: &str) -> ProviderResult<ProviderStreamItem> {
         return Ok(ProviderStreamItem::Done);
     }
     if let Some(message) = chunk.message {
-        if let Some(content) = message.content {
-            return Ok(ProviderStreamItem::AssistantDelta(content));
-        }
         if let Some(calls) = message.tool_calls {
             let mut calls = calls.into_iter();
             let call = calls
@@ -132,6 +129,9 @@ pub fn parse_chat_chunk(input: &str) -> ProviderResult<ProviderStreamItem> {
                     ))
                 })?,
             }));
+        }
+        if let Some(content) = message.content.filter(|content| !content.is_empty()) {
+            return Ok(ProviderStreamItem::AssistantDelta(content));
         }
     }
     Err(ProviderError::protocol("unsupported Ollama chat chunk"))
@@ -166,6 +166,21 @@ mod tests {
     fn parses_tool_call_chunk() {
         let item = parse_chat_chunk(
             r#"{"message":{"tool_calls":[{"function":{"name":"fs","arguments":{"op":"list_dir","path":"src"}}}]},"done":false}"#,
+        )
+        .unwrap();
+        match item {
+            ProviderStreamItem::ToolCall(call) => {
+                assert_eq!(call.name, "fs");
+                assert!(call.arguments_json.contains("\"list_dir\""));
+            }
+            other => panic!("unexpected item: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_tool_call_chunk_with_empty_content() {
+        let item = parse_chat_chunk(
+            r#"{"message":{"content":"","tool_calls":[{"function":{"name":"fs","arguments":{"op":"list_dir","path":"src"}}}]},"done":false}"#,
         )
         .unwrap();
         match item {
