@@ -1,1 +1,349 @@
-pub struct SessionContext;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Turn {
+    pub role: &'static str,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolObservation {
+    pub tool_name: String,
+    pub body: String,
+    pub raw_body: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionContext {
+    pub limit: usize,
+    pub summary: Option<String>,
+    pub recent_turns: Vec<Turn>,
+    pub tool_observations: Vec<ToolObservation>,
+}
+
+const TURN_OVERHEAD_TOKENS: usize = 12;
+const TOOL_OBSERVATION_OVERHEAD_TOKENS: usize = 12;
+
+impl SessionContext {
+    pub fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            summary: None,
+            recent_turns: Vec::new(),
+            tool_observations: Vec::new(),
+        }
+    }
+
+    pub fn push_user(&mut self, content: &str) {
+        self.recent_turns.push(Turn {
+            role: "user",
+            content: content.into(),
+        });
+    }
+
+    pub fn push_assistant(&mut self, content: &str) {
+        self.recent_turns.push(Turn {
+            role: "assistant",
+            content: content.into(),
+        });
+    }
+
+    pub fn push_tool_output(&mut self, tool_name: &str, body: &str) {
+        self.tool_observations.push(ToolObservation {
+            tool_name: tool_name.into(),
+            body: body.into(),
+            raw_body: None,
+        });
+    }
+
+    pub fn prune_if_needed(&mut self) {
+        if !self.should_prune() {
+            return;
+        }
+
+        self.compact_old_tool_outputs();
+        self.prune_old_tool_observations();
+
+        while self.estimated_tokens() > self.limit && self.recent_turns.len() > 1 {
+            let removed = self.recent_turns.remove(0);
+            self.append_turn_summary(removed);
+        }
+
+        self.prune_old_tool_observations();
+        while self.estimated_tokens() > self.limit && self.compact_summary() {}
+    }
+
+    fn should_prune(&self) -> bool {
+        let threshold = self.limit.saturating_sub(self.limit / 5).max(1);
+        self.estimated_tokens() >= threshold
+    }
+
+    fn estimated_tokens(&self) -> usize {
+        let summary_tokens = self.summary.as_deref().map_or(0, estimate_text_tokens);
+        let turn_tokens = self
+            .recent_turns
+            .iter()
+            .map(|turn| {
+                TURN_OVERHEAD_TOKENS
+                    + estimate_text_tokens(turn.role)
+                    + estimate_text_tokens(&turn.content)
+            })
+            .sum::<usize>();
+        let tool_tokens = self
+            .tool_observations
+            .iter()
+            .map(|observation| {
+                TOOL_OBSERVATION_OVERHEAD_TOKENS
+                    + estimate_text_tokens(&observation.tool_name)
+                    + estimate_text_tokens(&observation.body)
+            })
+            .sum::<usize>();
+
+        summary_tokens + turn_tokens + tool_tokens
+    }
+
+    fn compact_old_tool_outputs(&mut self) {
+        let last_index = self.tool_observations.len().saturating_sub(1);
+        for index in 0..self.tool_observations.len() {
+            if !self.should_prune() {
+                return;
+            }
+            if index == last_index {
+                break;
+            }
+            if self.tool_observations[index].raw_body.is_some() {
+                continue;
+            }
+
+            let compacted = summarize_tool_body(&self.tool_observations[index].body);
+            if compacted != self.tool_observations[index].body {
+                self.tool_observations[index].raw_body =
+                    Some(self.tool_observations[index].body.clone());
+                self.tool_observations[index].body = compacted;
+            }
+        }
+    }
+
+    fn append_turn_summary(&mut self, turn: Turn) {
+        let next = format!("{}: {}", turn.role, summarize_turn_content(&turn.content));
+        match self.summary.as_mut() {
+            Some(summary) if !summary.is_empty() => {
+                summary.push('\n');
+                summary.push_str(&next);
+            }
+            Some(summary) => summary.push_str(&next),
+            None => self.summary = Some(next),
+        }
+    }
+
+    fn compact_summary(&mut self) -> bool {
+        let Some(summary) = self.summary.as_mut() else {
+            return false;
+        };
+        let compacted = summarize_summary(summary);
+        if compacted == *summary {
+            return false;
+        }
+        *summary = compacted;
+        true
+    }
+
+    fn prune_old_tool_observations(&mut self) {
+        while self.estimated_tokens() > self.limit && self.tool_observations.len() > 1 {
+            let removed = self.tool_observations.remove(0);
+            self.append_tool_summary(removed);
+        }
+    }
+
+    fn append_tool_summary(&mut self, observation: ToolObservation) {
+        let body = observation.raw_body.unwrap_or(observation.body);
+        let next = format!(
+            "tool {}: {}",
+            observation.tool_name,
+            summarize_tool_body(&body)
+        );
+        match self.summary.as_mut() {
+            Some(summary) if !summary.is_empty() => {
+                summary.push('\n');
+                summary.push_str(&next);
+            }
+            Some(summary) => summary.push_str(&next),
+            None => self.summary = Some(next),
+        }
+    }
+}
+
+fn estimate_text_tokens(text: &str) -> usize {
+    text.chars().count().div_ceil(4)
+}
+
+fn summarize_tool_body(body: &str) -> String {
+    let preview = body
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .take(2)
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    if preview.is_empty() {
+        "summary: (empty tool output)".into()
+    } else {
+        format!("summary: {preview}")
+    }
+}
+
+fn summarize_turn_content(content: &str) -> String {
+    let words = content.split_whitespace().collect::<Vec<_>>();
+    if words.len() <= 4 {
+        return words.join(" ");
+    }
+
+    format!("{} …", words[..4].join(" "))
+}
+
+fn summarize_summary(summary: &str) -> String {
+    let trimmed = summary.trim();
+    if trimmed == "older context" {
+        return trimmed.into();
+    }
+    if trimmed.len() <= 16 {
+        return "older context".into();
+    }
+
+    let target_len = (trimmed.len() / 2).max(16);
+    let mut compacted = trimmed.chars().take(target_len).collect::<String>();
+    if let Some((head, _)) = compacted.rsplit_once(char::is_whitespace) {
+        compacted = head.to_string();
+    }
+
+    if compacted.is_empty() || compacted == trimmed {
+        "older context".into()
+    } else {
+        format!("{compacted} …")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prunes_old_turns_into_summary() {
+        let mut context = SessionContext::new(40);
+        context.push_user("one two three four five six");
+        context.push_assistant("alpha beta gamma delta epsilon zeta");
+        context.push_user("recent");
+
+        context.prune_if_needed();
+
+        assert!(context.summary.as_deref().unwrap_or("").contains("one two"));
+        assert_eq!(context.recent_turns.last().unwrap().content, "recent");
+    }
+
+    #[test]
+    fn compacts_old_tool_output_before_recent_turns() {
+        let mut context = SessionContext::new(30);
+        context.push_tool_output("list", "alpha\nbeta\ngamma\ndelta\nepsilon\nzeta");
+        context.push_tool_output("stat", "recent\nraw\noutput");
+        context.push_user("what changed?");
+
+        context.prune_if_needed();
+
+        assert!(!context.tool_observations.is_empty());
+        assert!(context.summary.is_some());
+        assert_eq!(context.tool_observations.len(), 1);
+        assert_eq!(context.tool_observations.last().unwrap().body, "recent\nraw\noutput");
+        assert_eq!(context.recent_turns.last().unwrap().content, "what changed?");
+    }
+
+    #[test]
+    fn keeps_raw_copy_of_recent_tool_output_when_compacting() {
+        let mut context = SessionContext::new(54);
+        context.push_tool_output("list", "alpha\nbeta\ngamma\ndelta\nepsilon\nzeta");
+        context.push_tool_output("stat", "recent\nraw\noutput");
+        context.push_user("what changed?");
+
+        context.prune_if_needed();
+
+        assert_eq!(
+            context.tool_observations[0].raw_body.as_deref(),
+            Some("alpha\nbeta\ngamma\ndelta\nepsilon\nzeta")
+        );
+    }
+
+    #[test]
+    fn keeps_only_tool_output_raw_for_follow_up_questions() {
+        let mut context = SessionContext::new(40);
+        context.push_tool_output("list", "a\nb\nc\nd\ne\nf");
+        context.push_user("what changed?");
+
+        context.prune_if_needed();
+
+        assert_eq!(context.tool_observations[0].body, "a\nb\nc\nd\ne\nf");
+        assert!(context.tool_observations[0].raw_body.is_none());
+    }
+
+    #[test]
+    fn summary_is_more_compact_than_removed_turns() {
+        let mut context = SessionContext::new(40);
+        context.push_user("one two three four five six");
+        context.push_assistant("alpha beta gamma delta epsilon zeta");
+        context.push_user("recent");
+
+        context.prune_if_needed();
+
+        let summary = context.summary.as_deref().unwrap_or("");
+        assert!(summary.contains("one two"));
+        assert!(!summary.contains("five six"));
+    }
+
+    #[test]
+    fn keeps_most_recent_tool_output_raw() {
+        let mut context = SessionContext::new(10);
+        context.push_tool_output("older", "a\nb\nc\nd\ne\nf");
+        context.push_tool_output("recent", "one\ntwo\nthree\nfour");
+        context.push_user("follow up question");
+
+        context.prune_if_needed();
+
+        assert!(context.summary.is_some());
+        assert_eq!(context.tool_observations.last().unwrap().tool_name, "recent");
+        assert_eq!(context.tool_observations.last().unwrap().body, "one\ntwo\nthree\nfour");
+    }
+
+    #[test]
+    fn estimates_tokens_approximately() {
+        assert_eq!(estimate_text_tokens("12345678"), 2);
+    }
+
+    #[test]
+    fn prune_if_needed_brings_context_within_budget() {
+        let mut context = SessionContext::new(20);
+        context.push_user("one two three four five six seven eight");
+        context.push_assistant("alpha beta gamma delta epsilon zeta eta theta");
+        context.push_user("iota kappa lambda mu nu xi omicron pi");
+        context.push_user("ok");
+
+        context.prune_if_needed();
+
+        assert!(
+            context.estimated_tokens() <= context.limit,
+            "estimated={} limit={} summary={:?} recent_turns={:?}",
+            context.estimated_tokens(),
+            context.limit,
+            context.summary,
+            context.recent_turns
+        );
+    }
+
+    #[test]
+    fn prunes_old_compacted_tool_observations_when_still_over_budget() {
+        let mut context = SessionContext::new(24);
+        context.push_tool_output("list", "a\nb\nc\nd\ne\nf");
+        context.push_tool_output("stat", "one\ntwo\nthree\nfour\nfive\nsix");
+
+        context.prune_if_needed();
+
+        assert!(context.estimated_tokens() <= context.limit);
+        assert_eq!(context.tool_observations.len(), 1);
+        assert_eq!(context.tool_observations[0].tool_name, "stat");
+    }
+}
