@@ -164,7 +164,7 @@ impl Config {
 }
 
 fn validate_ollama_url(raw: &str) -> Result<Url> {
-    let url = Url::parse(raw).map_err(|_| anyhow!("ollama_url must be a full base URL"))?;
+    let url = Url::parse(raw).map_err(|e| anyhow!("ollama_url must be a full base URL: {e}"))?;
 
     if url.host_str().is_none() || url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
         bail!("ollama_url must be a full base URL");
@@ -292,6 +292,17 @@ context_limit_tokens = 2048
     }
 
     #[test]
+    fn rejects_zero_context_limit_in_toml() {
+        let res = FileConfig::from_toml_str(
+            r#"
+ollama_url = "http://file:11434"
+context_limit_tokens = 0
+"#,
+        );
+        assert!(res.is_err());
+    }
+
+    #[test]
     fn rejects_zero_context_limit() {
         let res = CliConfig::from_args([
             "glass",
@@ -311,6 +322,18 @@ context_limit_tokens = 2048
             .unwrap_err()
             .to_string();
         assert!(error.contains("ollama_url"));
+    }
+
+    #[test]
+    fn missing_context_limit_tokens_is_error() {
+        let error = Config::from_sources(
+            CliConfig { ollama_url: Some("http://cli:11434".into()), context_limit_tokens: None },
+            EnvConfig::default(),
+            FileConfig::default(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("context_limit_tokens"));
     }
 
     #[test]
