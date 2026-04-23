@@ -36,10 +36,3 @@ fn module_smoke_test() {
     assert_module_smoke();
 }
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn module_smoke_test() {
-        super::assert_module_smoke();
-    }
-}
