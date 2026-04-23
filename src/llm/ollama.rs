@@ -104,11 +104,11 @@ struct TagModel {
     name: String,
 }
 
-pub fn parse_chat_chunk(input: &str) -> ProviderResult<ProviderStreamItem> {
+pub fn parse_chat_chunk(input: &str) -> ProviderResult<Option<ProviderStreamItem>> {
     let chunk: ChatChunk = serde_json::from_str(input)
         .map_err(|error| ProviderError::protocol(format!("invalid Ollama chat chunk: {error}")))?;
     if chunk.done {
-        return Ok(ProviderStreamItem::Done);
+        return Ok(Some(ProviderStreamItem::Done));
     }
     if let Some(message) = chunk.message {
         if let Some(calls) = message.tool_calls {
@@ -121,18 +121,19 @@ pub fn parse_chat_chunk(input: &str) -> ProviderResult<ProviderStreamItem> {
                     "multiple tool calls in a single Ollama chunk are not supported yet",
                 ));
             }
-            return Ok(ProviderStreamItem::ToolCall(ToolCall {
+            return Ok(Some(ProviderStreamItem::ToolCall(ToolCall {
                 name: call.function.name,
                 arguments_json: serde_json::to_string(&call.function.arguments).map_err(|error| {
                     ProviderError::protocol(format!(
                         "failed to serialize Ollama tool-call arguments: {error}"
                     ))
                 })?,
-            }));
+            })));
         }
         if let Some(content) = message.content.filter(|content| !content.is_empty()) {
-            return Ok(ProviderStreamItem::AssistantDelta(content));
+            return Ok(Some(ProviderStreamItem::AssistantDelta(content)));
         }
+        return Ok(None);
     }
     Err(ProviderError::protocol("unsupported Ollama chat chunk"))
 }
@@ -146,8 +147,15 @@ fn validate_model_listing(input: &str, expected_model: &str) -> ProviderResult<(
         return Ok(());
     }
 
+    let available = tags
+        .models
+        .iter()
+        .map(|model| model.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+
     Err(ProviderError::validation(format!(
-        "required Ollama model {expected_model} is unavailable from the configured server"
+        "required Ollama model {expected_model} is unavailable from the configured server; available models: [{available}]"
     )))
 }
 
@@ -159,7 +167,7 @@ mod tests {
     #[test]
     fn parses_assistant_delta_chunk() {
         let item = parse_chat_chunk(r#"{"message":{"content":"hello"},"done":false}"#).unwrap();
-        assert_eq!(item, ProviderStreamItem::AssistantDelta("hello".into()));
+        assert_eq!(item, Some(ProviderStreamItem::AssistantDelta("hello".into())));
     }
 
     #[test]
@@ -169,7 +177,7 @@ mod tests {
         )
         .unwrap();
         match item {
-            ProviderStreamItem::ToolCall(call) => {
+            Some(ProviderStreamItem::ToolCall(call)) => {
                 assert_eq!(call.name, "fs");
                 assert!(call.arguments_json.contains("\"list_dir\""));
             }
@@ -184,7 +192,7 @@ mod tests {
         )
         .unwrap();
         match item {
-            ProviderStreamItem::ToolCall(call) => {
+            Some(ProviderStreamItem::ToolCall(call)) => {
                 assert_eq!(call.name, "fs");
                 assert!(call.arguments_json.contains("\"list_dir\""));
             }
@@ -195,7 +203,7 @@ mod tests {
     #[test]
     fn parses_done_chunk() {
         let item = parse_chat_chunk(r#"{"done":true}"#).unwrap();
-        assert_eq!(item, ProviderStreamItem::Done);
+        assert_eq!(item, Some(ProviderStreamItem::Done));
     }
 
     #[test]
@@ -222,5 +230,11 @@ mod tests {
         .to_string();
 
         assert!(error.contains("multiple tool calls"));
+    }
+
+    #[test]
+    fn ignores_empty_message_chunk() {
+        let item = parse_chat_chunk(r#"{"message":{},"done":false}"#).unwrap();
+        assert_eq!(item, None);
     }
 }
