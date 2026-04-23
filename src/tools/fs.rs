@@ -143,8 +143,8 @@ impl FsTool {
                 Ok(_) => {
                     let mut resolved = current.canonicalize().with_context(|| {
                         format!(
-                            "failed to resolve '{current}' against startup directory '{}'",
-                            self.root.display(),
+                            "failed to resolve '{current}' inside startup directory '{root}'",
+                            root = self.root.display(),
                             current = current.display()
                         )
                     })?;
@@ -252,7 +252,6 @@ mod tests {
         let root = test_root("symlink");
         let outside = test_root("outside");
         let _ = fs::remove_dir_all(&root);
-        let _ = fs::remove_file(root.join("escape.txt"));
         let _ = fs::remove_dir_all(&outside);
         fs::create_dir_all(&root).unwrap();
         fs::create_dir_all(&outside).unwrap();
@@ -349,6 +348,19 @@ mod tests {
         let error = tool.read_file("nested").unwrap_err().to_string();
         assert!(error.contains("failed to read file 'nested'"));
         assert!(error.contains("startup directory"));
+    }
+
+    #[test]
+    fn invalid_utf8_returns_distinct_error() {
+        let root = test_root("invalid-utf8");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let _guard = TestDirGuard(root.clone());
+        fs::write(root.join("binary.dat"), vec![0xff, 0xfe, 0xfd]).unwrap();
+
+        let tool = FsTool::new(root.clone()).unwrap();
+        let error = tool.read_file("binary.dat").unwrap_err().to_string();
+        assert!(error.contains("contains invalid UTF-8"));
     }
 
     fn text_body(result: &ToolResult) -> &str {
