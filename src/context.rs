@@ -17,6 +17,8 @@ impl Turn {
 pub struct ToolObservation {
     tool_name: String,
     body: String,
+    // internal flag indicating whether this observation has been compacted
+    is_compacted: bool,
 }
 
 impl ToolObservation {
@@ -87,6 +89,7 @@ impl SessionContext {
         self.tool_observations.push(ToolObservation {
             tool_name: tool_name.into(),
             body: body.into(),
+            is_compacted: false,
         });
         // Enforce recent-only raw retention: compact older tool outputs immediately
         // so only the most recent RAW_TOOL_WINDOW remain as full raw bodies.
@@ -156,7 +159,7 @@ impl SessionContext {
         // memory. Keep a small recent window of full bodies (RAW_TOOL_WINDOW)
         // and replace older observations with a compacted summary.
         // Safe to call multiple times; already-compacted bodies are recognized
-        // and not re-compacted (idempotent behavior).
+        // and not re-compacted (idempotent behavior via the is_compacted flag).
         let n = self.tool_observations.len();
         if n == 0 {
             return;
@@ -170,9 +173,14 @@ impl SessionContext {
             }
 
             // Older than the recent window: replace the body with a compacted
-            // summary.
-            let compacted = summarize_tool_body(&self.tool_observations[index].body);
-            self.tool_observations[index].body = compacted;
+            // summary if not already compacted.
+            let obs = &mut self.tool_observations[index];
+            if obs.is_compacted {
+                continue;
+            }
+            let compacted = summarize_tool_body(&obs.body);
+            obs.body = compacted;
+            obs.is_compacted = true;
         }
     }
 
@@ -212,11 +220,14 @@ impl SessionContext {
 
     fn append_tool_summary(&mut self, observation: ToolObservation) {
         let body = observation.body;
-        let next = format!(
-            "tool {}: {}",
-            observation.tool_name,
+        // If the observation was already compacted, use its body as-is; otherwise
+        // produce a compacted summary string.
+        let summary_part = if observation.is_compacted {
+            body
+        } else {
             summarize_tool_body(&body)
-        );
+        };
+        let next = format!("tool {}: {}", observation.tool_name, summary_part);
         match self.summary.as_mut() {
             Some(summary) if !summary.is_empty() => {
                 summary.push('\n');
@@ -233,12 +244,8 @@ fn estimate_text_tokens(text: &str) -> usize {
 }
 
 fn summarize_tool_body(body: &str) -> String {
-    // Avoid double-summarization: if the body already looks like a compacted
-    // summary we should return it as-is to keep compaction idempotent.
-    if body.trim_start().starts_with("summary:") {
-        return body.to_string();
-    }
-
+    // Produce a compacted preview of the tool output. This function assumes
+    // callers use the is_compacted flag to avoid double-compaction.
     let preview = body
         .lines()
         .filter(|line| !line.trim().is_empty())
@@ -297,8 +304,8 @@ mod tests {
 
         context.prune_if_needed();
 
-        assert!(context.summary.as_deref().unwrap_or("").contains("one two"));
-        assert_eq!(context.recent_turns.last().unwrap().content, "recent");
+        assert!(context.summary().unwrap_or("").contains("one two"));
+        assert_eq!(context.recent_turns().last().unwrap().content(), "recent");
     }
 
     #[test]
@@ -310,11 +317,11 @@ mod tests {
 
         context.prune_if_needed();
 
-        assert!(!context.tool_observations.is_empty());
-        assert!(context.summary.is_some());
-        assert_eq!(context.tool_observations.len(), 1);
-        assert_eq!(context.tool_observations.last().unwrap().body, "recent\nraw\noutput");
-        assert_eq!(context.recent_turns.last().unwrap().content, "what changed?");
+        assert!(!context.tool_observations().is_empty());
+        assert!(context.summary().is_some());
+        assert_eq!(context.tool_observations().len(), 1);
+        assert_eq!(context.tool_observations().last().unwrap().body(), "recent\nraw\noutput");
+        assert_eq!(context.recent_turns().last().unwrap().content(), "what changed?");
     }
 
     #[test]
@@ -327,12 +334,12 @@ mod tests {
 
         context.prune_if_needed();
 
-        assert_eq!(context.tool_observations.len(), 3);
+        assert_eq!(context.tool_observations().len(), 3);
         // the oldest observation(s) should be compacted and start with "summary:"
-        assert!(context.tool_observations[0].body.starts_with("summary:"), "oldest must be compacted");
+        assert!(context.tool_observations()[0].body().starts_with("summary:"), "oldest must be compacted");
         // the most recent RAW_TOOL_WINDOW observations keep their full bodies
-        assert_eq!(context.tool_observations[1].body, "middle\ncontent");
-        assert_eq!(context.tool_observations[2].body, "recent\nraw\noutput");
+        assert_eq!(context.tool_observations()[1].body(), "middle\ncontent");
+        assert_eq!(context.tool_observations()[2].body(), "recent\nraw\noutput");
     }
 
     #[test]
@@ -343,7 +350,7 @@ mod tests {
 
         context.prune_if_needed();
 
-        assert_eq!(context.tool_observations[0].body, "a\nb\nc\nd\ne\nf");
+        assert_eq!(context.tool_observations()[0].body(), "a\nb\nc\nd\ne\nf");
     }
 
     #[test]
@@ -355,7 +362,7 @@ mod tests {
 
         context.prune_if_needed();
 
-        let summary = context.summary.as_deref().unwrap_or("");
+        let summary = context.summary().unwrap_or("");
         assert!(summary.contains("one two"));
         assert!(!summary.contains("five six"));
     }
@@ -369,9 +376,9 @@ mod tests {
 
         context.prune_if_needed();
 
-        assert!(context.summary.is_some());
-        assert_eq!(context.tool_observations.last().unwrap().tool_name, "recent");
-        assert_eq!(context.tool_observations.last().unwrap().body, "one\ntwo\nthree\nfour");
+        assert!(context.summary().is_some());
+        assert_eq!(context.tool_observations().last().unwrap().tool_name(), "recent");
+        assert_eq!(context.tool_observations().last().unwrap().body(), "one\ntwo\nthree\nfour");
     }
 
     #[test]
@@ -422,9 +429,9 @@ mod tests {
 
         context.prune_if_needed();
 
-        assert!(context.estimated_tokens() <= context.limit);
-        assert_eq!(context.tool_observations.len(), 1);
-        assert_eq!(context.tool_observations[0].tool_name, "stat");
+        assert!(context.estimated_tokens() <= context.limit());
+        assert_eq!(context.tool_observations().len(), 1);
+        assert_eq!(context.tool_observations()[0].tool_name(), "stat");
     }
 
     #[test]
