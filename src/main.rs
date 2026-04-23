@@ -1,10 +1,14 @@
-#![allow(dead_code)]
-
 mod agent;
+
+#[allow(dead_code)]
 mod config;
+#[allow(dead_code)]
 mod context;
+#[allow(dead_code)]
 mod llm;
+#[allow(dead_code)]
 mod tools;
+#[allow(dead_code)]
 mod tui;
 
 fn main() {}
