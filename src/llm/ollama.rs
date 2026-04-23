@@ -219,6 +219,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains(DEFAULT_OLLAMA_MODEL));
+        assert!(error.contains("other"));
     }
 
     #[test]
