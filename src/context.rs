@@ -311,18 +311,21 @@ mod tests {
     }
 
     #[test]
-    fn keeps_raw_copy_of_recent_tool_output_when_compacting() {
-        let mut context = SessionContext::new(54);
-        context.push_tool_output("list", "alpha\nbeta\ngamma\ndelta\nepsilon\nzeta");
-        context.push_tool_output("stat", "recent\nraw\noutput");
+    fn compacts_older_tool_outputs_but_keeps_recent_raw_bodies() {
+        let mut context = SessionContext::new(1000);
+        context.push_tool_output("t1", "alpha\nbeta\ngamma\ndelta\nepsilon\nzeta");
+        context.push_tool_output("t2", "middle\ncontent");
+        context.push_tool_output("t3", "recent\nraw\noutput");
         context.push_user("what changed?");
 
         context.prune_if_needed();
 
-        // We no longer retain full raw bodies for older observations.
-        for obs in &context.tool_observations {
-            assert!(!obs.body.is_empty(), "body must be present");
-        }
+        assert_eq!(context.tool_observations.len(), 3);
+        // the oldest observation(s) should be compacted and start with "summary:"
+        assert!(context.tool_observations[0].body.starts_with("summary:"), "oldest must be compacted");
+        // the most recent RAW_TOOL_WINDOW observations keep their full bodies
+        assert_eq!(context.tool_observations[1].body, "middle\ncontent");
+        assert_eq!(context.tool_observations[2].body, "recent\nraw\noutput");
     }
 
     #[test]
@@ -334,7 +337,6 @@ mod tests {
         context.prune_if_needed();
 
         assert_eq!(context.tool_observations[0].body, "a\nb\nc\nd\ne\nf");
-        // raw_body removed; ensure body is present (checked above)
     }
 
     #[test]
