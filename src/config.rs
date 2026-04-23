@@ -172,8 +172,20 @@ fn validate_ollama_url(raw: &str) -> Result<Url> {
         _ => bail!("ollama_url must use http or https scheme"),
     }
 
-    if url.host_str().is_none() || url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
-        bail!("ollama_url must be a full base URL");
+    // Require a non-empty host explicitly
+    if url.host_str().map(|h| h.is_empty()).unwrap_or(true) {
+        bail!("ollama_url must include a non-empty host");
+    }
+
+    // Disallow path, query, or fragment beyond a base '/'
+    if url.path() != "/" {
+        bail!("ollama_url must be a base URL and must not include a path");
+    }
+    if url.query().is_some() {
+        bail!("ollama_url must not include a query string");
+    }
+    if url.fragment().is_some() {
+        bail!("ollama_url must not include a fragment");
     }
 
     Ok(url)
@@ -255,6 +267,27 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("ollama_url"));
+    }
+
+    #[test]
+    fn rejects_non_http_scheme() {
+        let cli = CliConfig {
+            ollama_url: Some("ftp://example.com".into()),
+            context_limit_tokens: Some(4096),
+        };
+
+        let error = Config::from_sources(cli, EnvConfig::default(), FileConfig::default())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("http") || error.contains("https"));
+    }
+
+    #[test]
+    fn rejects_zero_context_limit_in_env() {
+        let res = EnvConfig::from_pairs([(CONTEXT_LIMIT_TOKENS_ENV, "0")]);
+        assert!(res.is_err());
+        let err = res.unwrap_err().to_string();
+        assert!(err.contains(CONTEXT_LIMIT_TOKENS_ENV) || err.contains("positive"));
     }
 
     #[test]
