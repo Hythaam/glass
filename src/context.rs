@@ -100,6 +100,10 @@ impl SessionContext {
             return;
         }
 
+        // Compact older tool outputs early so that pruning can remove whole
+        // observations if compaction doesn't reduce tokens enough. This reduces
+        // overall token usage before we attempt to drop observations.
+        // compact_old_tool_outputs() is safe to call repeatedly.
         self.compact_old_tool_outputs();
         self.prune_old_tool_observations();
 
@@ -197,6 +201,9 @@ impl SessionContext {
     }
 
     fn prune_old_tool_observations(&mut self) {
+        // Remove oldest tool observations (usually already compacted) while we're
+        // still over the token budget. We keep at least one tool observation so
+        // recent raw tool output remains available for follow-ups.
         while self.estimated_tokens() > self.limit && self.tool_observations.len() > 1 {
             let removed = self.tool_observations.remove(0);
             self.append_tool_summary(removed);
@@ -394,12 +401,16 @@ mod tests {
         context.prune_if_needed();
 
         assert!(
-            context.estimated_tokens() <= context.limit,
+            context.estimated_tokens() <= context.limit(),
             "estimated={} limit={} summary={:?} recent_turns={:?}",
             context.estimated_tokens(),
-            context.limit,
-            context.summary,
-            context.recent_turns
+            context.limit(),
+            context.summary(),
+            context
+                .recent_turns()
+                .iter()
+                .map(|t| t.content())
+                .collect::<Vec<_>>()
         );
     }
 
@@ -424,26 +435,25 @@ mod tests {
         ctx.push_tool_output("t3", "alpha\nbeta\ngamma\ndelta");
         ctx.push_tool_output("t4", "recent\nraw\noutput");
 
-        // First compaction pass
-        ctx.compact_old_tool_outputs();
+        // Use the public surface: prune_if_needed() will call compaction under the hood.
+        ctx.prune_if_needed();
 
-        let n = ctx.tool_observations.len();
-        let keep = RAW_TOOL_WINDOW.min(n);
-        if n > keep {
-            for i in 0..(n - keep) {
-                let b = &ctx.tool_observations[i].body;
-                assert!(b.starts_with("summary:") || !b.is_empty());
-                assert!(!b.contains("summary: summary:"), "double summary at idx {}", i);
-            }
-        }
+        // Capture the current bodies via public accessors.
+        let bodies_before: Vec<String> = ctx
+            .tool_observations()
+            .iter()
+            .map(|o| o.body().to_string())
+            .collect();
 
-        // Second compaction pass should be safe: it must not add extra 'summary:' prefixes
-        ctx.compact_old_tool_outputs();
-        if n > keep {
-            for i in 0..(n - keep) {
-                let b = &ctx.tool_observations[i].body;
-                assert!(!b.contains("summary: summary:"), "double summary after second compaction at idx {}", i);
-            }
+        // Compaction should have occurred for at least one observation.
+        assert!(bodies_before.iter().any(|b| b.starts_with("summary:")));
+
+        // Re-run the same public action; compaction must be idempotent and not
+        // produce double-prefixed summaries.
+        ctx.prune_if_needed();
+
+        for b in ctx.tool_observations().iter().map(|o| o.body()) {
+            assert!(!b.contains("summary: summary:"), "double summary detected");
         }
     }
 }
