@@ -1,4 +1,3 @@
-use anyhow::{Result, anyhow};
 use futures::future::BoxFuture;
 use reqwest::{Client, Url};
 use serde::Deserialize;
@@ -28,7 +27,7 @@ impl OllamaProvider {
         }
     }
 
-    pub async fn validate_model_available(&self) -> ProviderResult<()> {
+    async fn validate_model_available(&self) -> ProviderResult<()> {
         let url = self.base_url.join("api/tags").map_err(|error| {
             ProviderError::validation(format!("invalid Ollama base URL: {error}"))
         })?;
@@ -105,8 +104,9 @@ struct TagModel {
     name: String,
 }
 
-pub fn parse_chat_chunk(input: &str) -> Result<ProviderStreamItem> {
-    let chunk: ChatChunk = serde_json::from_str(input)?;
+pub fn parse_chat_chunk(input: &str) -> ProviderResult<ProviderStreamItem> {
+    let chunk: ChatChunk = serde_json::from_str(input)
+        .map_err(|error| ProviderError::protocol(format!("invalid Ollama chat chunk: {error}")))?;
     if chunk.done {
         return Ok(ProviderStreamItem::Done);
     }
@@ -114,19 +114,27 @@ pub fn parse_chat_chunk(input: &str) -> Result<ProviderStreamItem> {
         if let Some(content) = message.content {
             return Ok(ProviderStreamItem::AssistantDelta(content));
         }
-        if let Some(mut calls) = message.tool_calls {
-            let call = calls.pop().ok_or_else(|| anyhow!("tool_calls was empty"))?;
+        if let Some(calls) = message.tool_calls {
+            let mut calls = calls.into_iter();
+            let call = calls
+                .next()
+                .ok_or_else(|| ProviderError::protocol("tool_calls was empty"))?;
+            if calls.next().is_some() {
+                return Err(ProviderError::protocol(
+                    "multiple tool calls in a single Ollama chunk are not supported yet",
+                ));
+            }
             return Ok(ProviderStreamItem::ToolCall(ToolCall {
                 name: call.function.name,
-                arguments_json: serde_json::to_string(&call.function.arguments)?,
+                arguments_json: serde_json::to_string(&call.function.arguments).map_err(|error| {
+                    ProviderError::protocol(format!(
+                        "failed to serialize Ollama tool-call arguments: {error}"
+                    ))
+                })?,
             }));
         }
     }
-    Err(anyhow!("unsupported Ollama chat chunk"))
-}
-
-fn default_model_available(input: &str) -> Result<()> {
-    validate_model_listing(input, DEFAULT_OLLAMA_MODEL).map_err(|error| anyhow!(error.to_string()))
+    Err(ProviderError::protocol("unsupported Ollama chat chunk"))
 }
 
 fn validate_model_listing(input: &str, expected_model: &str) -> ProviderResult<()> {
@@ -178,13 +186,26 @@ mod tests {
     #[test]
     fn accepts_validation_response_with_default_model() {
         let body = r#"{"models":[{"name":"llama3.1:8b"},{"name":"other"}]}"#;
-        assert!(default_model_available(body).is_ok());
+        assert!(validate_model_listing(body, DEFAULT_OLLAMA_MODEL).is_ok());
     }
 
     #[test]
     fn rejects_validation_response_without_default_model() {
         let body = r#"{"models":[{"name":"other"}]}"#;
-        let error = default_model_available(body).unwrap_err().to_string();
+        let error = validate_model_listing(body, DEFAULT_OLLAMA_MODEL)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains(DEFAULT_OLLAMA_MODEL));
+    }
+
+    #[test]
+    fn rejects_multi_tool_call_chunk() {
+        let error = parse_chat_chunk(
+            r#"{"message":{"tool_calls":[{"function":{"name":"fs","arguments":{"op":"list_dir","path":"src"}}},{"function":{"name":"fs","arguments":{"op":"read_file","path":"src/main.rs"}}}]},"done":false}"#,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("multiple tool calls"));
     }
 }
