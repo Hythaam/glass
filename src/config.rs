@@ -11,7 +11,7 @@ const CONTEXT_LIMIT_TOKENS_FLAG: &str = "--context-limit-tokens";
 const OLLAMA_URL_ENV: &str = "GLASS_OLLAMA_URL";
 const CONTEXT_LIMIT_TOKENS_ENV: &str = "GLASS_CONTEXT_LIMIT_TOKENS";
 const CONFIG_FILE_RELATIVE_PATH: &str = ".config/glass/config.toml";
-const MIN_CONTEXT_LIMIT_TOKENS: usize = 512;
+const MIN_CONTEXT_LIMIT_TOKENS: usize = 1;
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct CliConfig {
@@ -155,10 +155,7 @@ impl Config {
             .ok_or_else(|| anyhow!("context_limit_tokens is required"))?;
 
         if context_limit_tokens < MIN_CONTEXT_LIMIT_TOKENS {
-            bail!(
-                "context_limit_tokens must be at least {}",
-                MIN_CONTEXT_LIMIT_TOKENS
-            );
+            bail!("context_limit_tokens must be a positive integer");
         }
 
         Ok(Self {
@@ -289,7 +286,7 @@ context_limit_tokens = 2048
         let error = Config::from_sources(
             CliConfig {
                 ollama_url: Some("http://cli:11434".into()),
-                context_limit_tokens: Some(511),
+                context_limit_tokens: Some(0),
             },
             EnvConfig::default(),
             FileConfig::default(),
