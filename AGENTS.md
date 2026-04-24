@@ -36,6 +36,7 @@ When behavior is not specified in this file, ask a clarifying question rather th
 coding_agent/
 ├── main.rs              # Startup, config loading, startup-directory resolution, TUI bootstrap
 ├── agent.rs             # Core loop: plan -> act -> observe -> repeat
+├── tui.rs               # Ratatui/Crossterm frontend and transcript/composer state
 ├── tools/
 │   ├── mod.rs           # Tool trait + dispatch registry
 │   └── fs.rs            # File operations inside the startup directory
@@ -91,6 +92,13 @@ If the current crate still contains `llm/openai.rs`, rename or replace it so the
 - Stream assistant and tool events to the TUI.
 - Stop cleanly on user exit or fatal error.
 - Keep internal planning text internal; only assistant output and tool events stream to the TUI.
+
+### `tui.rs`
+
+- Own the Ratatui/Crossterm frontend only.
+- Render the scrolling transcript and bottom composer.
+- Keep fold state, hit testing, scrolling, and input editing local to the TUI layer.
+- Forward submitted user input into the async agent and render streamed agent/tool events inline.
 
 ### `tools/mod.rs`
 

@@ -1,22 +1,20 @@
 use anyhow::{Context, Result, anyhow};
+use serde::Deserialize;
+use serde_json::json;
 use std::ffi::OsString;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 
-use super::ToolResult;
+use super::{ToolExecutor, ToolResult};
+use crate::llm::{ToolCall, ToolDefinition, ToolFunction};
 
-// TODO (deferred from Task 3): expose a `stat_path` helper on the public tools/fs.rs surface
-// This helper should let callers query path metadata (size, is_dir, modified) without
-// reading full file contents. Implementing stat_path was intentionally deferred from Task 3
-// and is required before later tool-dispatch work that needs lightweight metadata checks.
 #[derive(Debug, Clone)]
 pub struct FsTool {
     root: PathBuf,
 }
 
 impl FsTool {
-
     pub fn new(root: PathBuf) -> Result<Self> {
         let root = root
             .canonicalize()
@@ -35,7 +33,9 @@ impl FsTool {
         })?;
 
         let body = String::from_utf8(bytes).map_err(|_| {
-            anyhow!("file '{input}' contains invalid UTF-8; this tool only supports reading text files")
+            anyhow!(
+                "file '{input}' contains invalid UTF-8; this tool only supports reading text files"
+            )
         })?;
 
         let preview = body.lines().next().unwrap_or_default().to_string();
@@ -200,6 +200,72 @@ impl FsTool {
     }
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+enum FsToolArguments {
+    ReadFile { path: String },
+    ListDir { path: String },
+}
+
+impl ToolExecutor for FsTool {
+    fn definitions(&self) -> Vec<ToolDefinition> {
+        vec![ToolDefinition {
+            r#type: "function".into(),
+            function: ToolFunction {
+                name: "fs".into(),
+                description: "Read files and directories inside the startup directory".into(),
+                parameters: json!({
+                    "type": "object",
+                    "oneOf": [
+                        {
+                            "type": "object",
+                            "properties": {
+                                "op": {
+                                    "type": "string",
+                                    "enum": ["read_file"]
+                                },
+                                "path": {
+                                    "type": "string",
+                                    "description": "Relative path to a UTF-8 text file inside the startup directory"
+                                }
+                            },
+                            "required": ["op", "path"]
+                        },
+                        {
+                            "type": "object",
+                            "properties": {
+                                "op": {
+                                    "type": "string",
+                                    "enum": ["list_dir"]
+                                },
+                                "path": {
+                                    "type": "string",
+                                    "description": "Relative path to a directory inside the startup directory"
+                                }
+                            },
+                            "required": ["op", "path"]
+                        }
+                    ]
+                }),
+            },
+        }]
+    }
+
+    fn execute(&mut self, call: &ToolCall) -> Result<ToolResult> {
+        if call.name != "fs" {
+            return Err(anyhow!("unsupported tool '{}'", call.name));
+        }
+
+        let arguments: FsToolArguments = serde_json::from_str(&call.arguments_json)
+            .with_context(|| format!("invalid arguments for tool '{}'", call.name))?;
+
+        match arguments {
+            FsToolArguments::ReadFile { path } => self.read_file(&path),
+            FsToolArguments::ListDir { path } => self.list_dir(&path),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -336,11 +402,8 @@ mod tests {
         fs::create_dir_all(root.join("nested")).unwrap();
         let _guard = TestDirGuard(root.clone());
         fs::write(root.join("nested").join("file.txt"), "hello").unwrap();
-        std::os::unix::fs::symlink(
-            root.join("nested").join("file.txt"),
-            root.join("link.txt"),
-        )
-        .unwrap();
+        std::os::unix::fs::symlink(root.join("nested").join("file.txt"), root.join("link.txt"))
+            .unwrap();
 
         let tool = FsTool::new(root.clone()).unwrap();
         let result = tool.read_file("link.txt").unwrap();

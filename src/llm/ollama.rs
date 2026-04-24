@@ -1,10 +1,13 @@
-use futures::future::BoxFuture;
+use futures::{StreamExt, future::{BoxFuture, ready}, stream::{self, BoxStream}};
 use reqwest::{Client, Url};
 use serde::Deserialize;
 use serde_json::Value;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use super::{
-    DEFAULT_OLLAMA_MODEL, Provider, ProviderError, ProviderResult, ProviderStreamItem, ToolCall,
+    ChatRequest, DEFAULT_OLLAMA_MODEL, Provider, ProviderError, ProviderResult,
+    ProviderStreamItem, ToolCall,
 };
 
 #[derive(Debug, Clone)]
@@ -65,6 +68,92 @@ impl Provider for OllamaProvider {
     fn validate<'a>(&'a self) -> BoxFuture<'a, ProviderResult<()>> {
         Box::pin(async move { self.validate_model_available().await })
     }
+
+    fn stream_chat<'a>(&'a self, request: ChatRequest) -> BoxStream<'a, ProviderResult<ProviderStreamItem>> {
+        let url = match self.base_url.join("api/chat") {
+            Ok(url) => url,
+            Err(error) => {
+                return Box::pin(stream::once(ready(Err(ProviderError::validation(
+                    format!("invalid Ollama base URL: {error}"),
+                )))));
+            }
+        };
+
+        let client = self.client.clone();
+        let model = self.model.clone();
+        let (tx, rx) = mpsc::unbounded_channel();
+
+        tokio::spawn(async move {
+            let payload = OllamaChatRequest {
+                model,
+                messages: request.messages,
+                tools: request.tools,
+                stream: true,
+            };
+
+            let response = match client.post(url.clone()).json(&payload).send().await {
+                Ok(response) => response,
+                Err(error) => {
+                    let _ = tx.send(Err(ProviderError::transport(format!(
+                        "failed to contact Ollama at {url}: {error}"
+                    ))));
+                    return;
+                }
+            };
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                let _ = tx.send(Err(ProviderError::transport(format!(
+                    "Ollama chat request failed at {url}: server returned {status}{}",
+                    if body.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" with body: {body}")
+                    }
+                ))));
+                return;
+            }
+
+            let mut stream = response.bytes_stream();
+            let mut buffer = Vec::new();
+
+            while let Some(chunk) = stream.next().await {
+                match chunk {
+                    Ok(chunk) => {
+                        buffer.extend_from_slice(&chunk);
+                        while let Some(position) = buffer.iter().position(|byte| *byte == b'\n') {
+                            let line = buffer.drain(..=position).collect::<Vec<_>>();
+                            if !forward_chat_line(&tx, &line) {
+                                return;
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        let _ = tx.send(Err(ProviderError::transport(format!(
+                            "failed to read Ollama stream from {url}: {error}"
+                        ))));
+                        return;
+                    }
+                }
+            }
+
+            if !buffer.is_empty() {
+                let _ = forward_chat_line(&tx, &buffer);
+            }
+        });
+
+        Box::pin(UnboundedReceiverStream::new(rx))
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+struct OllamaChatRequest {
+    model: String,
+    messages: Vec<super::ChatMessage>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    tools: Vec<super::ToolDefinition>,
+    stream: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -123,11 +212,13 @@ pub fn parse_chat_chunk(input: &str) -> ProviderResult<Option<ProviderStreamItem
             }
             return Ok(Some(ProviderStreamItem::ToolCall(ToolCall {
                 name: call.function.name,
-                arguments_json: serde_json::to_string(&call.function.arguments).map_err(|error| {
-                    ProviderError::protocol(format!(
-                        "failed to serialize Ollama tool-call arguments: {error}"
-                    ))
-                })?,
+                arguments_json: serde_json::to_string(&call.function.arguments).map_err(
+                    |error| {
+                        ProviderError::protocol(format!(
+                            "failed to serialize Ollama tool-call arguments: {error}"
+                        ))
+                    },
+                )?,
             })));
         }
         if let Some(content) = message.content.filter(|content| !content.is_empty()) {
@@ -135,7 +226,7 @@ pub fn parse_chat_chunk(input: &str) -> ProviderResult<Option<ProviderStreamItem
         }
         return Ok(None);
     }
-    Err(ProviderError::protocol("unsupported Ollama chat chunk"))
+    Ok(None)
 }
 
 fn validate_model_listing(input: &str, expected_model: &str) -> ProviderResult<()> {
@@ -159,15 +250,50 @@ fn validate_model_listing(input: &str, expected_model: &str) -> ProviderResult<(
     )))
 }
 
+fn forward_chat_line(
+    tx: &mpsc::UnboundedSender<ProviderResult<ProviderStreamItem>>,
+    line: &[u8],
+) -> bool {
+    let line = match std::str::from_utf8(line) {
+        Ok(line) => line.trim(),
+        Err(error) => {
+            let _ = tx.send(Err(ProviderError::protocol(format!(
+                "invalid UTF-8 in Ollama chat stream: {error}"
+            ))));
+            return false;
+        }
+    };
+
+    if line.is_empty() {
+        return true;
+    }
+
+    match parse_chat_chunk(line) {
+        Ok(Some(item)) => tx.send(Ok(item)).is_ok(),
+        Ok(None) => true,
+        Err(error) => {
+            let _ = tx.send(Err(error));
+            false
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::ProviderStreamItem;
+    use crate::llm::{ChatMessage, ChatRequest, ChatRole, ProviderStreamItem, ToolDefinition, ToolFunction};
+    use futures::StreamExt;
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     #[test]
     fn parses_assistant_delta_chunk() {
         let item = parse_chat_chunk(r#"{"message":{"content":"hello"},"done":false}"#).unwrap();
-        assert_eq!(item, Some(ProviderStreamItem::AssistantDelta("hello".into())));
+        assert_eq!(
+            item,
+            Some(ProviderStreamItem::AssistantDelta("hello".into()))
+        );
     }
 
     #[test]
@@ -237,5 +363,149 @@ mod tests {
     fn ignores_empty_message_chunk() {
         let item = parse_chat_chunk(r#"{"message":{},"done":false}"#).unwrap();
         assert_eq!(item, None);
+    }
+
+    #[test]
+    fn ignores_chunk_without_message() {
+        let item = parse_chat_chunk(r#"{"done":false}"#).unwrap();
+        assert_eq!(item, None);
+    }
+
+    #[tokio::test]
+    async fn stream_chat_posts_tools_and_yields_stream_items() {
+        let received_body = Arc::new(Mutex::new(String::new()));
+        let server = TestServer::spawn(chunked_response(&[
+            r#"{"message":{"content":"hello"},"done":false}"#,
+            r#"{"message":{"tool_calls":[{"function":{"name":"fs","arguments":{"op":"list_dir","path":"src"}}}]},"done":false}"#,
+            r#"{"done":true}"#,
+        ]), received_body.clone())
+        .await;
+        let provider = OllamaProvider::new(server.url());
+        let request = ChatRequest {
+            messages: vec![
+                ChatMessage {
+                    role: ChatRole::User,
+                    content: "show src".into(),
+                    tool_name: None,
+                    tool_calls: None,
+                },
+                ChatMessage {
+                    role: ChatRole::Tool,
+                    content: "agent.rs\nmain.rs".into(),
+                    tool_name: Some("fs".into()),
+                    tool_calls: None,
+                },
+            ],
+            tools: vec![ToolDefinition {
+                r#type: "function".into(),
+                function: ToolFunction {
+                    name: "fs".into(),
+                    description: "Read files from the startup directory".into(),
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "op": { "type": "string" },
+                            "path": { "type": "string" }
+                        },
+                        "required": ["op", "path"]
+                    }),
+                },
+            }],
+        };
+
+        let items = provider
+            .stream_chat(request)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<ProviderResult<Vec<_>>>()
+            .unwrap();
+
+        assert_eq!(
+            items,
+            vec![
+                ProviderStreamItem::AssistantDelta("hello".into()),
+                ProviderStreamItem::ToolCall(ToolCall {
+                    name: "fs".into(),
+                    arguments_json: r#"{"op":"list_dir","path":"src"}"#.into(),
+                }),
+                ProviderStreamItem::Done,
+            ]
+        );
+
+        let body = received_body.lock().unwrap().clone();
+        assert!(body.contains("\"tools\""));
+        assert!(body.contains("\"tool_name\":\"fs\""));
+    }
+
+    struct TestServer {
+        url: Url,
+    }
+
+    impl TestServer {
+        async fn spawn(response: String, received_body: Arc<Mutex<String>>) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let request = read_http_request(&mut socket).await;
+                *received_body.lock().unwrap() = request;
+                socket.write_all(response.as_bytes()).await.unwrap();
+            });
+            Self {
+                url: Url::parse(&format!("http://{address}/")).unwrap(),
+            }
+        }
+
+        fn url(&self) -> Url {
+            self.url.clone()
+        }
+    }
+
+    async fn read_http_request(socket: &mut tokio::net::TcpStream) -> String {
+        let mut buffer = Vec::new();
+        let mut chunk = [0_u8; 1024];
+
+        loop {
+            let count = socket.read(&mut chunk).await.unwrap();
+            buffer.extend_from_slice(&chunk[..count]);
+            if buffer.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+
+        let header_end = buffer
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .unwrap()
+            + 4;
+        let headers = String::from_utf8(buffer[..header_end].to_vec()).unwrap();
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("content-length: ")
+                    .or_else(|| line.strip_prefix("Content-Length: "))
+            })
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(0);
+        let mut body = buffer[header_end..].to_vec();
+        while body.len() < content_length {
+            let count = socket.read(&mut chunk).await.unwrap();
+            body.extend_from_slice(&chunk[..count]);
+        }
+
+        String::from_utf8(body).unwrap()
+    }
+
+    fn chunked_response(lines: &[&str]) -> String {
+        let mut response =
+            "HTTP/1.1 200 OK\r\ncontent-type: application/x-ndjson\r\ntransfer-encoding: chunked\r\n\r\n"
+                .to_string();
+        for line in lines {
+            let payload = format!("{line}\n");
+            response.push_str(&format!("{:x}\r\n{}\r\n", payload.len(), payload));
+        }
+        response.push_str("0\r\n\r\n");
+        response
     }
 }

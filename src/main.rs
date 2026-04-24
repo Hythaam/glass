@@ -1,49 +1,38 @@
 mod agent;
-
 mod config;
-#[allow(dead_code)]
 mod context;
-#[allow(dead_code)]
 mod llm;
-#[allow(dead_code)]
 mod tools;
-#[allow(dead_code)]
 mod tui;
 
-fn main() {
-    if let Err(error) = run() {
+use anyhow::{Context, Result};
+use llm::Provider;
+
+use crate::agent::Agent;
+use crate::config::Config;
+use crate::context::SessionContext;
+use crate::llm::ollama::OllamaProvider;
+use crate::tools::fs::FsTool;
+use crate::tui::TuiApp;
+
+#[tokio::main]
+async fn main() {
+    if let Err(error) = run().await {
         eprintln!("{error:#}");
         std::process::exit(1);
     }
 }
 
-fn run() -> anyhow::Result<()> {
-    // Load config to validate startup settings at startup. `_config` is unused for now
-    // but will be consumed by features added later; keeping this load ensures early
-    // validation of CLI/env/config values.
-    let _config = config::Config::load(std::env::args_os())?;
-    Ok(())
-}
+async fn run() -> Result<()> {
+    let config = Config::load(std::env::args_os())?;
+    let startup_dir =
+        std::env::current_dir().context("failed to determine the current working directory")?;
+    let provider = OllamaProvider::new(config.ollama_url.clone());
+    provider.validate().await?;
 
-#[cfg(test)]
-fn assert_module_smoke() {
-    use crate::agent::AgentEvent;
-    use crate::llm::ProviderStreamItem;
-    use crate::tools::ToolResult;
+    let tools = FsTool::new(startup_dir.clone())?;
+    let context = SessionContext::new(config.context_limit_tokens);
+    let agent = Agent::new(provider, tools, context);
 
-    let _ = AgentEvent::AssistantDelta {
-        turn_id: 1,
-        text: "hi".into(),
-    };
-    let _ = ProviderStreamItem::Done;
-    let _ = ToolResult::Text {
-        preview: "ok".into(),
-        body: "ok".into(),
-    };
-}
-
-#[cfg(test)]
-#[test]
-fn module_smoke_test() {
-    assert_module_smoke();
+    TuiApp::new(agent, startup_dir).run().await
 }

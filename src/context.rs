@@ -1,13 +1,21 @@
+use crate::llm::{ChatMessage, ChatRequest, ChatRole, ProviderResult, ToolCall};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Turn {
     role: &'static str,
     content: String,
+    tool_calls: Vec<ToolCall>,
+    sequence: u64,
 }
 
 impl Turn {
+    #[cfg(test)]
+    #[allow(dead_code)]
     pub fn role(&self) -> &'static str {
         self.role
     }
+    #[cfg(test)]
+    #[allow(dead_code)]
     pub fn content(&self) -> &str {
         &self.content
     }
@@ -19,16 +27,23 @@ pub struct ToolObservation {
     body: String,
     // internal flag indicating whether this observation has been compacted
     is_compacted: bool,
+    sequence: u64,
 }
 
 impl ToolObservation {
+    #[cfg(test)]
+    #[allow(dead_code)]
     pub fn tool_name(&self) -> &str {
         &self.tool_name
     }
+    #[cfg(test)]
+    #[allow(dead_code)]
     pub fn body(&self) -> &str {
         &self.body
     }
     /// Read-only accessor to indicate whether the observation has been compacted.
+    #[cfg(test)]
+    #[allow(dead_code)]
     pub fn is_compacted(&self) -> bool {
         self.is_compacted
     }
@@ -40,10 +55,13 @@ pub struct SessionContext {
     summary: Option<String>,
     recent_turns: Vec<Turn>,
     tool_observations: Vec<ToolObservation>,
+    next_sequence: u64,
 }
 
 impl SessionContext {
     /// Read-only accessor for configured token limit.
+    #[cfg(test)]
+    #[allow(dead_code)]
     pub fn limit(&self) -> usize {
         self.limit
     }
@@ -52,12 +70,78 @@ impl SessionContext {
         self.summary.as_deref()
     }
     /// Read-only slice of recent turns.
+    #[cfg(test)]
+    #[allow(dead_code)]
     pub fn recent_turns(&self) -> &[Turn] {
         &self.recent_turns
     }
     /// Read-only slice of tool observations.
+    #[cfg(test)]
+    #[allow(dead_code)]
     pub fn tool_observations(&self) -> &[ToolObservation] {
         &self.tool_observations
+    }
+
+    pub fn chat_request(&self) -> ProviderResult<ChatRequest> {
+        let mut messages = Vec::new();
+
+        if let Some(summary) = self.summary() {
+            messages.push(ChatMessage {
+                role: ChatRole::System,
+                content: format!("Conversation summary:\n{summary}"),
+                tool_name: None,
+                tool_calls: None,
+            });
+        }
+
+        let mut timeline = Vec::with_capacity(self.recent_turns.len() + self.tool_observations.len());
+
+        for turn in &self.recent_turns {
+            let role = match turn.role {
+                "user" => ChatRole::User,
+                "assistant" => ChatRole::Assistant,
+                _ => ChatRole::System,
+            };
+            let tool_calls = if turn.tool_calls.is_empty() {
+                None
+            } else {
+                Some(
+                    turn.tool_calls
+                        .iter()
+                        .map(ToolCall::as_chat_tool_call)
+                        .collect::<ProviderResult<Vec<_>>>()?,
+                )
+            };
+            timeline.push((
+                turn.sequence,
+                ChatMessage {
+                    role,
+                    content: turn.content.clone(),
+                    tool_name: None,
+                    tool_calls,
+                },
+            ));
+        }
+
+        for observation in &self.tool_observations {
+            timeline.push((
+                observation.sequence,
+                ChatMessage {
+                    role: ChatRole::Tool,
+                    content: observation.body.clone(),
+                    tool_name: Some(observation.tool_name.clone()),
+                    tool_calls: None,
+                },
+            ));
+        }
+
+        timeline.sort_by_key(|(sequence, _)| *sequence);
+        messages.extend(timeline.into_iter().map(|(_, message)| message));
+
+        Ok(ChatRequest {
+            messages,
+            tools: Vec::new(),
+        })
     }
 }
 
@@ -72,28 +156,49 @@ impl SessionContext {
             summary: None,
             recent_turns: Vec::new(),
             tool_observations: Vec::new(),
+            next_sequence: 0,
         }
     }
 
     pub fn push_user(&mut self, content: &str) {
+        let sequence = self.reserve_sequence();
         self.recent_turns.push(Turn {
             role: "user",
             content: content.into(),
+            tool_calls: Vec::new(),
+            sequence,
         });
     }
 
     pub fn push_assistant(&mut self, content: &str) {
+        let sequence = self.reserve_sequence();
         self.recent_turns.push(Turn {
             role: "assistant",
             content: content.into(),
+            tool_calls: Vec::new(),
+            sequence,
         });
     }
 
+    pub fn push_assistant_tool_call(&mut self, call: &ToolCall) -> ProviderResult<()> {
+        call.as_chat_tool_call()?;
+        let sequence = self.reserve_sequence();
+        self.recent_turns.push(Turn {
+            role: "assistant",
+            content: String::new(),
+            tool_calls: vec![call.clone()],
+            sequence,
+        });
+        Ok(())
+    }
+
     pub fn push_tool_output(&mut self, tool_name: &str, body: &str) {
+        let sequence = self.reserve_sequence();
         self.tool_observations.push(ToolObservation {
             tool_name: tool_name.into(),
             body: body.into(),
             is_compacted: false,
+            sequence,
         });
         // Enforce recent-only raw retention: compact older tool outputs immediately
         // so only the most recent RAW_TOOL_WINDOW remain as full raw bodies.
@@ -132,6 +237,12 @@ impl SessionContext {
     fn should_prune(&self) -> bool {
         let threshold = self.limit.saturating_sub(self.limit / 5).max(1);
         self.estimated_tokens() >= threshold
+    }
+
+    fn reserve_sequence(&mut self) -> u64 {
+        let sequence = self.next_sequence;
+        self.next_sequence += 1;
+        sequence
     }
 
     fn estimated_tokens(&self) -> usize {
@@ -189,7 +300,17 @@ impl SessionContext {
     }
 
     fn append_turn_summary(&mut self, turn: Turn) {
-        let next = format!("{}: {}", turn.role, summarize_turn_content(&turn.content));
+        let next = if turn.tool_calls.is_empty() {
+            format!("{}: {}", turn.role, summarize_turn_content(&turn.content))
+        } else {
+            let tool_names = turn
+                .tool_calls
+                .iter()
+                .map(|call| call.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("assistant tool call: {tool_names}")
+        };
         match self.summary.as_mut() {
             Some(summary) if !summary.is_empty() => {
                 summary.push('\n');
@@ -298,6 +419,7 @@ fn summarize_summary(summary: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::llm::{ChatRole, ToolCall};
 
     #[test]
     fn prunes_old_turns_into_summary() {
@@ -324,8 +446,14 @@ mod tests {
         assert!(!context.tool_observations().is_empty());
         assert!(context.summary().is_some());
         assert_eq!(context.tool_observations().len(), 1);
-        assert_eq!(context.tool_observations().last().unwrap().body(), "recent\nraw\noutput");
-        assert_eq!(context.recent_turns().last().unwrap().content(), "what changed?");
+        assert_eq!(
+            context.tool_observations().last().unwrap().body(),
+            "recent\nraw\noutput"
+        );
+        assert_eq!(
+            context.recent_turns().last().unwrap().content(),
+            "what changed?"
+        );
     }
 
     #[test]
@@ -340,7 +468,10 @@ mod tests {
 
         assert_eq!(context.tool_observations().len(), 3);
         // the oldest observation(s) should be compacted
-        assert!(context.tool_observations()[0].is_compacted(), "oldest must be compacted");
+        assert!(
+            context.tool_observations()[0].is_compacted(),
+            "oldest must be compacted"
+        );
         // the most recent RAW_TOOL_WINDOW observations keep their full bodies
         assert_eq!(context.tool_observations()[1].body(), "middle\ncontent");
         assert_eq!(context.tool_observations()[2].body(), "recent\nraw\noutput");
@@ -381,8 +512,14 @@ mod tests {
         context.prune_if_needed();
 
         assert!(context.summary().is_some());
-        assert_eq!(context.tool_observations().last().unwrap().tool_name(), "recent");
-        assert_eq!(context.tool_observations().last().unwrap().body(), "one\ntwo\nthree\nfour");
+        assert_eq!(
+            context.tool_observations().last().unwrap().tool_name(),
+            "recent"
+        );
+        assert_eq!(
+            context.tool_observations().last().unwrap().body(),
+            "one\ntwo\nthree\nfour"
+        );
     }
 
     #[test]
@@ -452,7 +589,12 @@ mod tests {
         // At least one observation should be marked compacted.
         let any_compacted = ctx.tool_observations().iter().any(|o| o.is_compacted());
         let removed_some = ctx.tool_observations().len() < 4;
-        assert!(any_compacted || removed_some, "expected compaction or pruning (len={} compacted={})", ctx.tool_observations().len(), any_compacted);
+        assert!(
+            any_compacted || removed_some,
+            "expected compaction or pruning (len={} compacted={})",
+            ctx.tool_observations().len(),
+            any_compacted
+        );
 
         // Re-run the same public action; compaction must be idempotent and not
         // produce double-prefixed summaries.
@@ -461,5 +603,34 @@ mod tests {
         for b in ctx.tool_observations().iter().map(|o| o.body()) {
             assert!(!b.contains("summary: summary:"), "double summary detected");
         }
+    }
+
+    #[test]
+    fn chat_request_interleaves_assistant_tool_calls_and_tool_results() {
+        let mut context = SessionContext::new(512);
+        context.push_user("show src");
+        context
+            .push_assistant_tool_call(&ToolCall {
+                name: "fs".into(),
+                arguments_json: r#"{"op":"list_dir","path":"src"}"#.into(),
+            })
+            .unwrap();
+        context.push_tool_output("fs", "agent.rs\nmain.rs");
+
+        let request = context.chat_request().unwrap();
+
+        assert_eq!(request.messages.len(), 3);
+        assert_eq!(request.messages[0].role, ChatRole::User);
+        assert_eq!(request.messages[1].role, ChatRole::Assistant);
+        assert_eq!(request.messages[2].role, ChatRole::Tool);
+        assert_eq!(request.messages[2].tool_name.as_deref(), Some("fs"));
+        assert_eq!(
+            request.messages[1]
+                .tool_calls
+                .as_ref()
+                .and_then(|calls| calls.first())
+                .map(|call| call.function.name.as_str()),
+            Some("fs")
+        );
     }
 }
