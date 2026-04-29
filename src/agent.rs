@@ -2,7 +2,7 @@ use anyhow::Result;
 use futures::StreamExt;
 
 use crate::context::SessionContext;
-use crate::llm::{Provider, ProviderStreamItem};
+use crate::llm::{Provider, ProviderStreamItem, RequestTokenUsage};
 use crate::tools::ToolExecutor;
 
 #[allow(dead_code)]
@@ -33,6 +33,14 @@ pub enum AgentEvent {
         turn_id: u64,
         message: String,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AgentStatus {
+    pub model_name: String,
+    pub context_tokens: usize,
+    pub context_limit: usize,
+    pub last_request_usage: Option<RequestTokenUsage>,
 }
 
 #[allow(dead_code)]
@@ -70,6 +78,15 @@ where
     P: Provider,
     T: ToolExecutor,
 {
+    pub fn status_snapshot(&self) -> AgentStatus {
+        AgentStatus {
+            model_name: self.provider.model().to_string(),
+            context_tokens: self.context.estimated_tokens_total(),
+            context_limit: self.context.limit(),
+            last_request_usage: self.context.latest_request_usage(),
+        }
+    }
+
     #[allow(dead_code)]
     pub async fn run_turn<F>(&mut self, input: &str, mut emit: F) -> Result<()>
     where
@@ -91,12 +108,8 @@ where
                 let item = match item {
                     Ok(item) => item,
                     Err(error) => {
-                        emit(AgentEvent::TurnError {
-                            turn_id,
-                            message: error.to_string(),
-                        });
-                        self.context.prune_if_needed();
-                        return Ok(());
+                        drop(stream);
+                        return self.finish_turn_error(turn_id, error.to_string(), &mut emit);
                     }
                 };
 
@@ -139,21 +152,29 @@ where
                             Err(error) => {
                                 self.context
                                     .push_tool_output(&tool_name, &format!("error: {error}"));
-                                emit(AgentEvent::TurnError {
+                                drop(stream);
+                                return self.finish_turn_error(
                                     turn_id,
-                                    message: error.to_string(),
-                                });
-                                self.context.prune_if_needed();
-                                return Ok(());
+                                    error.to_string(),
+                                    &mut emit,
+                                );
                             }
                         }
 
                         break;
                     }
-                    ProviderStreamItem::Done => {
-                        if !assistant_text.is_empty() {
-                            self.context.push_assistant(&assistant_text);
+                    ProviderStreamItem::Done { usage } => {
+                        if assistant_text.is_empty() {
+                            drop(stream);
+                            return self.finish_turn_error(
+                                turn_id,
+                                "provider completed with no assistant content or tool calls; the configured llama.cpp model may not support tool calling",
+                                &mut emit,
+                            );
                         }
+
+                        self.context
+                            .push_assistant_with_usage(&assistant_text, usage);
                         emit(AgentEvent::AssistantDone { turn_id });
                         self.context.prune_if_needed();
                         return Ok(());
@@ -162,14 +183,31 @@ where
             }
 
             if !requested_tool {
-                emit(AgentEvent::TurnError {
+                drop(stream);
+                return self.finish_turn_error(
                     turn_id,
-                    message: "provider stream ended before signaling completion".into(),
-                });
-                self.context.prune_if_needed();
-                return Ok(());
+                    "provider stream ended before signaling completion",
+                    &mut emit,
+                );
             }
         }
+    }
+
+    fn finish_turn_error<F>(
+        &mut self,
+        turn_id: u64,
+        message: impl Into<String>,
+        emit: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(AgentEvent),
+    {
+        emit(AgentEvent::TurnError {
+            turn_id,
+            message: message.into(),
+        });
+        self.context.prune_if_needed();
+        Ok(())
     }
 }
 
@@ -201,28 +239,36 @@ fn tool_output_chunks(body: &str) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::context::SessionContext;
-    use crate::llm::{
-        ChatRequest, ChatRole, Provider, ProviderError, ProviderResult, ProviderStreamItem,
-        ToolCall,
-    };
-    use crate::tools::{ToolExecutor, ToolResult};
-    use futures::{future::{BoxFuture, ready}, stream::{self, BoxStream}};
-    use reqwest::Url;
-    use std::cell::RefCell;
-    use std::collections::VecDeque;
+    use crate::llm::{ChatRole, ProviderStreamItem, RequestTokenUsage, ToolCall};
+    use crate::test_support::fakes::{FakeProvider, FakeTools};
+
+    fn test_agent(provider: FakeProvider, tools: FakeTools) -> Agent<FakeProvider, FakeTools> {
+        Agent::new(provider, tools, SessionContext::new(512, None))
+    }
+
+    fn fs_call(op: &str, path: &str) -> ProviderStreamItem {
+        ProviderStreamItem::ToolCall(ToolCall {
+            name: "fs".into(),
+            arguments_json: format!(r#"{{"op":"{op}","path":"{path}"}}"#),
+        })
+    }
+
+    fn assert_has_event(events: &[AgentEvent], predicate: impl Fn(&AgentEvent) -> bool) {
+        assert!(
+            events.iter().any(predicate),
+            "missing expected event: {events:?}"
+        );
+    }
 
     #[tokio::test]
     async fn turn_with_tool_call_emits_tool_and_assistant_events() {
         let provider = FakeProvider::new(vec![
-            ProviderStreamItem::ToolCall(ToolCall {
-                name: "fs".into(),
-                arguments_json: r#"{"op":"list_dir","path":"src"}"#.into(),
-            }),
+            fs_call("list_dir", "src"),
             ProviderStreamItem::AssistantDelta("done".into()),
-            ProviderStreamItem::Done,
+            ProviderStreamItem::Done { usage: None },
         ]);
         let tools = FakeTools::with_text("src files", "agent.rs\nmain.rs");
-        let mut agent = Agent::new(provider, tools, SessionContext::new(512));
+        let mut agent = test_agent(provider, tools);
         let mut events = Vec::new();
 
         agent
@@ -230,40 +276,32 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(
-            events
-                .iter()
-                .any(|event| matches!(event, AgentEvent::ToolStarted { .. }))
+        assert_has_event(&events, |event| {
+            matches!(event, AgentEvent::ToolStarted { .. })
+        });
+        assert_has_event(&events, |event| {
+            matches!(event, AgentEvent::ToolOutputDelta { .. })
+        });
+        assert_has_event(&events, |event| {
+            matches!(event, AgentEvent::ToolFinished { .. })
+        });
+        assert_has_event(
+            &events,
+            |event| matches!(event, AgentEvent::AssistantDelta { text, .. } if text == "done"),
         );
-        assert!(
-            events
-                .iter()
-                .any(|event| matches!(event, AgentEvent::ToolOutputDelta { .. }))
-        );
-        assert!(
-            events
-                .iter()
-                .any(|event| matches!(event, AgentEvent::ToolFinished { .. }))
-        );
-        assert!(events.iter().any(
-            |event| matches!(event, AgentEvent::AssistantDelta { text, .. } if text == "done")
-        ));
-        assert!(events
-            .iter()
-            .any(|event| matches!(event, AgentEvent::AssistantDone { .. })));
+        assert_has_event(&events, |event| {
+            matches!(event, AgentEvent::AssistantDone { .. })
+        });
     }
 
     #[tokio::test]
     async fn tool_output_is_added_to_context_before_follow_up_provider_call() {
         let provider = FakeProvider::new(vec![
-            ProviderStreamItem::ToolCall(ToolCall {
-                name: "fs".into(),
-                arguments_json: r#"{"op":"read_file","path":"src/agent.rs"}"#.into(),
-            }),
-            ProviderStreamItem::Done,
+            fs_call("read_file", "src/agent.rs"),
+            ProviderStreamItem::Done { usage: None },
         ]);
         let tools = FakeTools::with_text("agent preview", "agent body");
-        let mut agent = Agent::new(provider, tools, SessionContext::new(512));
+        let mut agent = test_agent(provider, tools);
 
         agent.run_turn("read agent", |_| {}).await.unwrap();
 
@@ -286,15 +324,12 @@ mod tests {
     async fn assistant_text_before_tool_call_is_preserved_for_follow_up_requests() {
         let provider = FakeProvider::new(vec![
             ProviderStreamItem::AssistantDelta("checking".into()),
-            ProviderStreamItem::ToolCall(ToolCall {
-                name: "fs".into(),
-                arguments_json: r#"{"op":"list_dir","path":"src"}"#.into(),
-            }),
+            fs_call("list_dir", "src"),
             ProviderStreamItem::AssistantDelta("done".into()),
-            ProviderStreamItem::Done,
+            ProviderStreamItem::Done { usage: None },
         ]);
         let tools = FakeTools::with_text("src files", "agent.rs\nmain.rs");
-        let mut agent = Agent::new(provider, tools, SessionContext::new(512));
+        let mut agent = test_agent(provider, tools);
 
         agent.run_turn("show src", |_| {}).await.unwrap();
 
@@ -303,17 +338,19 @@ mod tests {
         assert!(requests[1].messages.iter().any(|message| {
             message.role == ChatRole::Assistant && message.content == "checking"
         }));
-        assert!(requests[1].messages.iter().any(|message| message.role == ChatRole::Tool));
+        assert!(
+            requests[1]
+                .messages
+                .iter()
+                .any(|message| message.role == ChatRole::Tool)
+        );
     }
 
     #[tokio::test]
     async fn tool_errors_are_recorded_in_context_and_emit_turn_error() {
-        let provider = FakeProvider::new(vec![ProviderStreamItem::ToolCall(ToolCall {
-            name: "fs".into(),
-            arguments_json: r#"{"op":"read_file","path":"missing.txt"}"#.into(),
-        })]);
+        let provider = FakeProvider::new(vec![fs_call("read_file", "missing.txt")]);
         let tools = FakeTools::failing("read failed");
-        let mut agent = Agent::new(provider, tools, SessionContext::new(512));
+        let mut agent = test_agent(provider, tools);
         let mut events = Vec::new();
 
         agent
@@ -325,144 +362,73 @@ mod tests {
         assert!(request.messages.iter().any(|message| {
             message.role == ChatRole::Tool && message.content.contains("error: read failed")
         }));
-        assert!(events.iter().any(
-            |event| matches!(event, AgentEvent::TurnError { message, .. } if message.contains("read failed"))
-        ));
+        assert_has_event(
+            &events,
+            |event| matches!(event, AgentEvent::TurnError { message, .. } if message.contains("read failed")),
+        );
     }
 
     #[tokio::test]
     async fn provider_errors_emit_turn_error_event() {
         let provider = FakeProvider::failing("provider down");
         let tools = FakeTools::with_text("unused", "unused");
-        let mut agent = Agent::new(provider, tools, SessionContext::new(512));
+        let mut agent = test_agent(provider, tools);
         let mut events = Vec::new();
 
-        agent.run_turn("hello", |event| events.push(event)).await.unwrap();
+        agent
+            .run_turn("hello", |event| events.push(event))
+            .await
+            .unwrap();
 
-        assert!(events.iter().any(
-            |event| matches!(event, AgentEvent::TurnError { message, .. } if message.contains("provider down"))
-        ));
+        assert_has_event(
+            &events,
+            |event| matches!(event, AgentEvent::TurnError { message, .. } if message.contains("provider down")),
+        );
     }
 
-    #[derive(Debug)]
-    struct FakeProvider {
-        #[allow(dead_code)]
-        base_url: Url,
-        queued_batches: RefCell<VecDeque<ProviderResult<Vec<ProviderStreamItem>>>>,
-        requests: RefCell<Vec<ChatRequest>>,
+    #[tokio::test]
+    async fn empty_completed_response_emits_turn_error() {
+        let provider = FakeProvider::new(vec![ProviderStreamItem::Done { usage: None }]);
+        let tools = FakeTools::with_text("unused", "unused");
+        let mut agent = test_agent(provider, tools);
+        let mut events = Vec::new();
+
+        agent
+            .run_turn("use the tool", |event| events.push(event))
+            .await
+            .unwrap();
+
+        assert_has_event(
+            &events,
+            |event| matches!(event, AgentEvent::TurnError { message, .. } if message.contains("no assistant content or tool calls")),
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::AssistantDone { .. }))
+        );
     }
 
-    impl FakeProvider {
-        fn new(items: Vec<ProviderStreamItem>) -> Self {
-            Self {
-                base_url: Url::parse("http://localhost:11434").unwrap(),
-                queued_batches: RefCell::new(queue_items_into_batches(items)),
-                requests: RefCell::new(Vec::new()),
-            }
-        }
+    #[tokio::test]
+    async fn assistant_turn_records_provider_usage_in_context() {
+        let provider = FakeProvider::new(vec![
+            ProviderStreamItem::AssistantDelta("done".into()),
+            ProviderStreamItem::Done {
+                usage: Some(RequestTokenUsage {
+                    prompt_tokens: 19,
+                    completion_tokens: 2,
+                    total_tokens: 21,
+                }),
+            },
+        ]);
+        let tools = FakeTools::with_text("unused", "unused");
+        let mut agent = test_agent(provider, tools);
 
-        fn failing(message: &str) -> Self {
-            Self {
-                base_url: Url::parse("http://localhost:11434").unwrap(),
-                queued_batches: RefCell::new(VecDeque::from([Err(ProviderError::transport(
-                    message,
-                ))])),
-                requests: RefCell::new(Vec::new()),
-            }
-        }
+        agent.run_turn("hello", |_| {}).await.unwrap();
 
-        fn requests(&self) -> Vec<ChatRequest> {
-            self.requests.borrow().clone()
-        }
-    }
-
-    impl Provider for FakeProvider {
-        fn base_url(&self) -> &Url {
-            &self.base_url
-        }
-
-        fn model(&self) -> &str {
-            "fake"
-        }
-
-        fn validate<'a>(&'a self) -> BoxFuture<'a, ProviderResult<()>> {
-            Box::pin(ready(Ok(())))
-        }
-
-        fn stream_chat<'a>(
-            &'a self,
-            request: ChatRequest,
-        ) -> BoxStream<'a, ProviderResult<ProviderStreamItem>> {
-            self.requests.borrow_mut().push(request);
-            let batch = self
-                .queued_batches
-                .borrow_mut()
-                .pop_front()
-                .unwrap_or_else(|| Ok(Vec::new()));
-            match batch {
-                Ok(items) => Box::pin(stream::iter(items.into_iter().map(Ok))),
-                Err(error) => Box::pin(stream::once(ready(Err(error)))),
-            }
-        }
-    }
-
-    #[derive(Debug)]
-    struct FakeTools {
-        result: std::result::Result<ToolResult, String>,
-    }
-
-    impl FakeTools {
-        fn with_text(preview: &str, body: &str) -> Self {
-            Self {
-                result: Ok(ToolResult::text(preview, body)),
-            }
-        }
-
-        fn failing(message: &str) -> Self {
-            Self {
-                result: Err(message.into()),
-            }
-        }
-    }
-
-    impl ToolExecutor for FakeTools {
-        fn definitions(&self) -> Vec<crate::llm::ToolDefinition> {
-            Vec::new()
-        }
-
-        fn execute(&mut self, call: &ToolCall) -> Result<ToolResult> {
-            if call.name != "fs" {
-                return Err(ProviderError::protocol("unsupported fake tool").into());
-            }
-
-            match &self.result {
-                Ok(result) => Ok(result.clone()),
-                Err(message) => Err(ProviderError::protocol(message).into()),
-            }
-        }
-    }
-
-    fn queue_items_into_batches(
-        items: Vec<ProviderStreamItem>,
-    ) -> VecDeque<ProviderResult<Vec<ProviderStreamItem>>> {
-        let mut queued_items: VecDeque<_> = items.into();
-        let mut batches = VecDeque::new();
-
-        while !queued_items.is_empty() {
-            let mut batch = Vec::new();
-            while let Some(item) = queued_items.pop_front() {
-                let stop = matches!(
-                    item,
-                    ProviderStreamItem::ToolCall(_) | ProviderStreamItem::Done
-                );
-                batch.push(item);
-                if stop {
-                    break;
-                }
-            }
-            batches.push_back(Ok(batch));
-        }
-
-        batches
+        let assistant_debug = format!("{:?}", agent.context().recent_turns().last().unwrap());
+        assert!(assistant_debug.contains("prompt_tokens: 19"));
+        assert!(assistant_debug.contains("completion_tokens: 2"));
+        assert!(assistant_debug.contains("total_tokens: 21"));
     }
 }

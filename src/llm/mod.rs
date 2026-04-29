@@ -1,4 +1,4 @@
-pub mod ollama;
+pub mod llama_cpp;
 
 use futures::{future::BoxFuture, stream::BoxStream};
 use reqwest::Url;
@@ -7,13 +7,18 @@ use serde_json::Value;
 use std::error::Error;
 use std::fmt;
 
-pub const DEFAULT_OLLAMA_MODEL: &str = "llama3.1:8b";
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderStreamItem {
     AssistantDelta(String),
     ToolCall(ToolCall),
-    Done,
+    Done { usage: Option<RequestTokenUsage> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestTokenUsage {
+    pub prompt_tokens: usize,
+    pub completion_tokens: usize,
+    pub total_tokens: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,6 +93,8 @@ pub struct ChatRequest {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ChatToolCall {
+    #[serde(rename = "type")]
+    pub r#type: String,
     pub function: ToolFunctionCall,
 }
 
@@ -121,8 +128,18 @@ impl ToolCall {
         })
     }
 
+    pub fn from_json_value(name: String, arguments: Value, context: &str) -> ProviderResult<Self> {
+        let arguments_json = serde_json::to_string(&arguments)
+            .map_err(|error| ProviderError::protocol(format!("{context}: {error}")))?;
+        Ok(Self {
+            name,
+            arguments_json,
+        })
+    }
+
     pub fn as_chat_tool_call(&self) -> ProviderResult<ChatToolCall> {
         Ok(ChatToolCall {
+            r#type: "function".into(),
             function: ToolFunctionCall {
                 name: self.name.clone(),
                 arguments: self.arguments_value()?,
@@ -136,6 +153,29 @@ pub trait Provider {
     fn base_url(&self) -> &Url;
     #[allow(dead_code)]
     fn model(&self) -> &str;
-    fn validate<'a>(&'a self) -> BoxFuture<'a, ProviderResult<()>>;
-    fn stream_chat<'a>(&'a self, request: ChatRequest) -> BoxStream<'a, ProviderResult<ProviderStreamItem>>;
+    fn validate<'a>(&'a mut self) -> BoxFuture<'a, ProviderResult<()>>;
+    /// The returned stream may borrow from `self`, so the provider must outlive stream consumption.
+    fn stream_chat<'a>(
+        &'a self,
+        request: ChatRequest,
+    ) -> BoxStream<'a, ProviderResult<ProviderStreamItem>>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chat_tool_call_serializes_with_function_type() {
+        let call = ToolCall {
+            name: "fs".into(),
+            arguments_json: r#"{"op":"read_file","path":"src/main.rs"}"#.into(),
+        };
+
+        let tool_call = call.as_chat_tool_call().unwrap();
+        let value = serde_json::to_value(tool_call).unwrap();
+
+        assert_eq!(value["type"], "function");
+        assert_eq!(value["function"]["name"], "fs");
+    }
 }

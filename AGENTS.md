@@ -14,7 +14,7 @@ When behavior is not specified in this file, ask a clarifying question rather th
 - Frontend: TUI only
 - Future extension: headless mode later, so core logic must stay UI-agnostic
 - Supported platforms: Linux and macOS
-- LLM provider: Ollama only
+- LLM provider: llama.cpp only
 - Tool approval: none; tool calls auto-run
 - Tool boundary: startup directory only
 - Session history: in-memory only for the active session
@@ -27,7 +27,7 @@ When behavior is not specified in this file, ask a clarifying question rather th
 - Persistent session history
 - Multiple LLM providers
 - Dedicated search tooling
-- Additional config beyond the Ollama server address
+- Additional config beyond the llama.cpp server address
 - Test requirements beyond unit tests
 
 ## Crate layout (v1)
@@ -36,29 +36,35 @@ When behavior is not specified in this file, ask a clarifying question rather th
 coding_agent/
 ├── main.rs              # Startup, config loading, startup-directory resolution, TUI bootstrap
 ├── agent.rs             # Core loop: plan -> act -> observe -> repeat
-├── tui.rs               # Ratatui/Crossterm frontend and transcript/composer state
 ├── tools/
 │   ├── mod.rs           # Tool trait + dispatch registry
 │   └── fs.rs            # File operations inside the startup directory
 ├── llm/
 │   ├── mod.rs           # Provider interface
-│   └── ollama.rs        # Ollama implementation for v1
+│   └── llama_cpp.rs     # llama.cpp implementation for v1
 ├── context.rs           # In-memory session history and pruning
-└── config.rs            # CLI/env/config-file loading for Ollama settings
+├── config.rs            # CLI/env/config-file loading for server settings
+└── tui/
+    ├── mod.rs           # TUI module wiring
+    ├── app.rs           # Terminal event loop, task spawning, and draw orchestration
+    ├── state.rs         # Input/composer/status state transitions
+    ├── transcript.rs    # Transcript entries, folding, selection, and scrolling
+    ├── render.rs        # Shared layout/render helpers
+    └── tests.rs         # TUI-focused unit tests
 ```
 
 Remove the dedicated search tool from v1. Directory inspection should happen through `fs`.
 
 If the current crate still contains `tools/search.rs`, remove it from the v1 path.  
-If the current crate still contains `llm/openai.rs`, rename or replace it so the crate reflects the actual Ollama-only v1 scope.
+If the current crate still contains `llm/openai.rs`, rename or replace it so the crate reflects the actual llama.cpp-only v1 scope.
 
 ## Runtime model
 
 1. Start from the current working directory. The startup directory is the tool root even when it is a subdirectory of a Git repo or not a Git repo at all.
-2. Load the v1 config values: the Ollama server address and the context pruning limit.
+2. Load the v1 config values: the llama.cpp server address, the context pruning limit, and the optional system prompt file.
 3. Start one in-memory chat session.
 4. Accept user input in the TUI.
-5. Send session context to the Ollama backend.
+5. Send session context to the llama.cpp backend.
 6. Stream assistant output to the TUI.
 7. When the assistant requests a tool, execute it automatically.
 8. Stream tool status and tool output to the TUI.
@@ -93,12 +99,14 @@ If the current crate still contains `llm/openai.rs`, rename or replace it so the
 - Stop cleanly on user exit or fatal error.
 - Keep internal planning text internal; only assistant output and tool events stream to the TUI.
 
-### `tui.rs`
+### `tui/`
 
 - Own the Ratatui/Crossterm frontend only.
-- Render the scrolling transcript and bottom composer.
-- Keep fold state, hit testing, scrolling, and input editing local to the TUI layer.
-- Forward submitted user input into the async agent and render streamed agent/tool events inline.
+- `app.rs` owns the terminal loop, task spawning, and draw orchestration.
+- `state.rs` owns composer/status/input transitions.
+- `transcript.rs` owns transcript rendering state, folding, selection, and scrolling.
+- `render.rs` owns shared layout and rendering helpers.
+- `tests.rs` owns TUI-focused unit coverage.
 
 ### `tools/mod.rs`
 
@@ -117,19 +125,19 @@ If the current crate still contains `llm/openai.rs`, rename or replace it so the
 ### `llm/mod.rs`
 
 - Define the provider interface.
-- v1 only needs Ollama, but the boundary should stay clean enough for later extension.
+- v1 only needs llama.cpp, but the boundary should stay clean enough for later extension.
 - The interface must support:
   - normal turns
   - streaming output
   - the mechanism used for tool requests
   - structured provider errors
 
-### `llm/ollama.rs`
+### `llm/llama_cpp.rs`
 
 - Implement the v1 provider.
-- Use only the configured Ollama server address.
-- Use the built-in default model name `llama3.1:8b` and fail fast with a clear startup error if that model is unavailable.
-- Use Ollama's `/api/chat` endpoint with streaming enabled and the endpoint's tool-calling shape for tool requests.
+- Use only the configured llama.cpp server address.
+- Discover the first available model from the configured llama.cpp server at startup and fail fast with a clear startup error if the server advertises no models.
+- Use the server's `/api/chat` endpoint with streaming enabled and its tool-calling shape for tool requests.
 
 ### `context.rs`
 
@@ -146,7 +154,7 @@ If the current crate still contains `llm/openai.rs`, rename or replace it so the
   - CLI flags
   - environment variables
   - `~/.config/glass/config.toml`
-- The v1 config values are the Ollama server address and the context pruning limit.
+- The v1 config values are the llama.cpp server address, the context pruning limit, and an optional system prompt file.
 - Validate config at startup and fail fast with a clear error.
 - Use the CLI flag name `--ollama-url`.
 - Use the environment variable name `GLASS_OLLAMA_URL`.
@@ -154,9 +162,13 @@ If the current crate still contains `llm/openai.rs`, rename or replace it so the
 - Use the CLI flag name `--context-limit-tokens`.
 - Use the environment variable name `GLASS_CONTEXT_LIMIT_TOKENS`.
 - Use the TOML key `context_limit_tokens`.
+- Use the CLI flag name `--system-prompt-file`.
+- Use the environment variable name `GLASS_SYSTEM_PROMPT_FILE`.
+- Use the TOML key `system_prompt_file`.
 - Apply precedence in the order CLI flag > environment variable > config file.
 - Require the value to be a full base URL, including scheme and port when needed.
 - Treat the context limit as an approximate token budget for pruning rather than an exact tokenizer guarantee.
+- Treat the system prompt file as a UTF-8 text file to load at startup and inject as the first system message in provider requests.
 
 ## Startup directory boundary rules
 
@@ -172,7 +184,7 @@ If the current crate still contains `llm/openai.rs`, rename or replace it so the
 - Tool activity and tool output must stream live.
 - Keep TUI code isolated so headless mode can be added later without rewriting the agent loop.
 - Use a single scrolling transcript pane with a bottom input composer; show tool activity and tool output inline in the transcript.
-- Use `Enter` to send, `Shift+Enter` to insert a newline, `PageUp`/`PageDown` to scroll the transcript, and `Ctrl+C` to quit.
+- Use `Enter` to send, `Ctrl+J` to insert a newline, `Shift+Enter` as an additional newline shortcut when the terminal reports it, `PageUp`/`PageDown` to scroll the transcript, mouse-wheel scrolling over the transcript for small scroll steps, and `Ctrl+C` to quit.
 - Fold long tool output inline behind a short preview and allow it to be expanded and collapsed in place on mouse click; do not add a separate pager in v1.
 
 ## Testing

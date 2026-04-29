@@ -1,10 +1,39 @@
-use crate::llm::{ChatMessage, ChatRequest, ChatRole, ProviderResult, ToolCall};
+use crate::llm::{ChatMessage, ChatRequest, ChatRole, ProviderResult, RequestTokenUsage, ToolCall};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenUsage {
+    estimated_tokens: usize,
+    exact_request_tokens: Option<RequestTokenUsage>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TurnRole {
+    User,
+    Assistant,
+}
+
+impl TurnRole {
+    fn as_chat_role(self) -> ChatRole {
+        match self {
+            Self::User => ChatRole::User,
+            Self::Assistant => ChatRole::Assistant,
+        }
+    }
+
+    fn as_label(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Assistant => "assistant",
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Turn {
-    role: &'static str,
+    role: TurnRole,
     content: String,
     tool_calls: Vec<ToolCall>,
+    token_usage: TokenUsage,
     sequence: u64,
 }
 
@@ -12,12 +41,18 @@ impl Turn {
     #[cfg(test)]
     #[allow(dead_code)]
     pub fn role(&self) -> &'static str {
-        self.role
+        self.role.as_label()
     }
     #[cfg(test)]
     #[allow(dead_code)]
     pub fn content(&self) -> &str {
         &self.content
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub fn token_usage(&self) -> &TokenUsage {
+        &self.token_usage
     }
 }
 
@@ -27,6 +62,7 @@ pub struct ToolObservation {
     body: String,
     // internal flag indicating whether this observation has been compacted
     is_compacted: bool,
+    token_usage: TokenUsage,
     sequence: u64,
 }
 
@@ -47,11 +83,37 @@ impl ToolObservation {
     pub fn is_compacted(&self) -> bool {
         self.is_compacted
     }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub fn token_usage(&self) -> &TokenUsage {
+        &self.token_usage
+    }
+}
+
+impl TokenUsage {
+    fn estimated_only(estimated_tokens: usize) -> Self {
+        Self {
+            estimated_tokens,
+            exact_request_tokens: None,
+        }
+    }
+
+    fn with_exact_request_tokens(
+        estimated_tokens: usize,
+        exact_request_tokens: Option<RequestTokenUsage>,
+    ) -> Self {
+        Self {
+            estimated_tokens,
+            exact_request_tokens,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionContext {
     limit: usize,
+    system_prompt: Option<String>,
     summary: Option<String>,
     recent_turns: Vec<Turn>,
     tool_observations: Vec<ToolObservation>,
@@ -60,8 +122,6 @@ pub struct SessionContext {
 
 impl SessionContext {
     /// Read-only accessor for configured token limit.
-    #[cfg(test)]
-    #[allow(dead_code)]
     pub fn limit(&self) -> usize {
         self.limit
     }
@@ -82,8 +142,28 @@ impl SessionContext {
         &self.tool_observations
     }
 
+    pub fn estimated_tokens_total(&self) -> usize {
+        self.estimated_tokens()
+    }
+
+    pub fn latest_request_usage(&self) -> Option<RequestTokenUsage> {
+        self.recent_turns
+            .iter()
+            .rev()
+            .find_map(|turn| turn.token_usage.exact_request_tokens.as_ref().cloned())
+    }
+
     pub fn chat_request(&self) -> ProviderResult<ChatRequest> {
         let mut messages = Vec::new();
+
+        if let Some(system_prompt) = &self.system_prompt {
+            messages.push(ChatMessage {
+                role: ChatRole::System,
+                content: system_prompt.clone(),
+                tool_name: None,
+                tool_calls: None,
+            });
+        }
 
         if let Some(summary) = self.summary() {
             messages.push(ChatMessage {
@@ -94,14 +174,10 @@ impl SessionContext {
             });
         }
 
-        let mut timeline = Vec::with_capacity(self.recent_turns.len() + self.tool_observations.len());
+        let mut timeline =
+            Vec::with_capacity(self.recent_turns.len() + self.tool_observations.len());
 
         for turn in &self.recent_turns {
-            let role = match turn.role {
-                "user" => ChatRole::User,
-                "assistant" => ChatRole::Assistant,
-                _ => ChatRole::System,
-            };
             let tool_calls = if turn.tool_calls.is_empty() {
                 None
             } else {
@@ -115,7 +191,7 @@ impl SessionContext {
             timeline.push((
                 turn.sequence,
                 ChatMessage {
-                    role,
+                    role: turn.role.as_chat_role(),
                     content: turn.content.clone(),
                     tool_name: None,
                     tool_calls,
@@ -150,9 +226,10 @@ const TOOL_OBSERVATION_OVERHEAD_TOKENS: usize = 12;
 const RAW_TOOL_WINDOW: usize = 2;
 
 impl SessionContext {
-    pub fn new(limit: usize) -> Self {
+    pub fn new(limit: usize, system_prompt: Option<String>) -> Self {
         Self {
             limit,
+            system_prompt,
             summary: None,
             recent_turns: Vec::new(),
             tool_observations: Vec::new(),
@@ -161,34 +238,47 @@ impl SessionContext {
     }
 
     pub fn push_user(&mut self, content: &str) {
-        let sequence = self.reserve_sequence();
-        self.recent_turns.push(Turn {
-            role: "user",
-            content: content.into(),
-            tool_calls: Vec::new(),
-            sequence,
-        });
+        self.push_turn(
+            TurnRole::User,
+            content,
+            Vec::new(),
+            TokenUsage::estimated_only(estimate_turn_tokens(TurnRole::User, content, &[])),
+        );
     }
 
     pub fn push_assistant(&mut self, content: &str) {
-        let sequence = self.reserve_sequence();
-        self.recent_turns.push(Turn {
-            role: "assistant",
-            content: content.into(),
-            tool_calls: Vec::new(),
-            sequence,
-        });
+        self.push_assistant_with_usage(content, None);
+    }
+
+    pub fn push_assistant_with_usage(
+        &mut self,
+        content: &str,
+        exact_request_tokens: Option<RequestTokenUsage>,
+    ) {
+        self.push_turn(
+            TurnRole::Assistant,
+            content,
+            Vec::new(),
+            TokenUsage::with_exact_request_tokens(
+                estimate_turn_tokens(TurnRole::Assistant, content, &[]),
+                exact_request_tokens,
+            ),
+        );
     }
 
     pub fn push_assistant_tool_call(&mut self, call: &ToolCall) -> ProviderResult<()> {
         call.as_chat_tool_call()?;
-        let sequence = self.reserve_sequence();
-        self.recent_turns.push(Turn {
-            role: "assistant",
-            content: String::new(),
-            tool_calls: vec![call.clone()],
-            sequence,
-        });
+        let tool_calls = vec![call.clone()];
+        self.push_turn(
+            TurnRole::Assistant,
+            "",
+            tool_calls.clone(),
+            TokenUsage::estimated_only(estimate_turn_tokens(
+                TurnRole::Assistant,
+                "",
+                &tool_calls,
+            )),
+        );
         Ok(())
     }
 
@@ -198,6 +288,9 @@ impl SessionContext {
             tool_name: tool_name.into(),
             body: body.into(),
             is_compacted: false,
+            token_usage: TokenUsage::estimated_only(estimate_tool_observation_tokens(
+                tool_name, body,
+            )),
             sequence,
         });
         // Enforce recent-only raw retention: compact older tool outputs immediately
@@ -227,10 +320,11 @@ impl SessionContext {
             self.append_turn_summary(removed);
         }
 
-        // NOTE: a previous implementation made an extra call to prune_old_tool_observations().
-        // That duplicate was removed because removing turns and compacting the summary
-        // also reduces token usage. We use compact_summary() here to further shrink
-        // the summary if needed.
+        // Re-check tool observations after turn pruning because new summary content can
+        // still leave the context over budget even when the earlier tool pass was enough
+        // before the summary grew.
+        self.prune_old_tool_observations();
+
         while self.estimated_tokens() > self.limit && self.compact_summary() {}
     }
 
@@ -245,28 +339,41 @@ impl SessionContext {
         sequence
     }
 
+    fn push_turn(
+        &mut self,
+        role: TurnRole,
+        content: &str,
+        tool_calls: Vec<ToolCall>,
+        token_usage: TokenUsage,
+    ) {
+        let sequence = self.reserve_sequence();
+        self.recent_turns.push(Turn {
+            role,
+            content: content.into(),
+            tool_calls,
+            token_usage,
+            sequence,
+        });
+    }
+
     fn estimated_tokens(&self) -> usize {
+        let system_prompt_tokens = self
+            .system_prompt
+            .as_deref()
+            .map_or(0, estimate_text_tokens);
         let summary_tokens = self.summary.as_deref().map_or(0, estimate_text_tokens);
         let turn_tokens = self
             .recent_turns
             .iter()
-            .map(|turn| {
-                TURN_OVERHEAD_TOKENS
-                    + estimate_text_tokens(turn.role)
-                    + estimate_text_tokens(&turn.content)
-            })
+            .map(|turn| turn.token_usage.estimated_tokens)
             .sum::<usize>();
         let tool_tokens = self
             .tool_observations
             .iter()
-            .map(|observation| {
-                TOOL_OBSERVATION_OVERHEAD_TOKENS
-                    + estimate_text_tokens(&observation.tool_name)
-                    + estimate_text_tokens(&observation.body)
-            })
+            .map(|observation| observation.token_usage.estimated_tokens)
             .sum::<usize>();
 
-        summary_tokens + turn_tokens + tool_tokens
+        system_prompt_tokens + summary_tokens + turn_tokens + tool_tokens
     }
 
     fn compact_old_tool_outputs(&mut self) {
@@ -296,12 +403,20 @@ impl SessionContext {
             let compacted = summarize_tool_body(&obs.body);
             obs.body = compacted;
             obs.is_compacted = true;
+            obs.token_usage = TokenUsage::estimated_only(estimate_tool_observation_tokens(
+                &obs.tool_name,
+                &obs.body,
+            ));
         }
     }
 
     fn append_turn_summary(&mut self, turn: Turn) {
         let next = if turn.tool_calls.is_empty() {
-            format!("{}: {}", turn.role, summarize_turn_content(&turn.content))
+            format!(
+                "{}: {}",
+                turn.role.as_label(),
+                summarize_turn_content(&turn.content)
+            )
         } else {
             let tool_names = turn
                 .tool_calls
@@ -311,14 +426,7 @@ impl SessionContext {
                 .join(", ");
             format!("assistant tool call: {tool_names}")
         };
-        match self.summary.as_mut() {
-            Some(summary) if !summary.is_empty() => {
-                summary.push('\n');
-                summary.push_str(&next);
-            }
-            Some(summary) => summary.push_str(&next),
-            None => self.summary = Some(next),
-        }
+        self.append_to_summary(next);
     }
 
     fn compact_summary(&mut self) -> bool {
@@ -353,6 +461,10 @@ impl SessionContext {
             summarize_tool_body(&body)
         };
         let next = format!("tool {}: {}", observation.tool_name, summary_part);
+        self.append_to_summary(next);
+    }
+
+    fn append_to_summary(&mut self, next: String) {
         match self.summary.as_mut() {
             Some(summary) if !summary.is_empty() => {
                 summary.push('\n');
@@ -366,6 +478,22 @@ impl SessionContext {
 
 fn estimate_text_tokens(text: &str) -> usize {
     text.chars().count().div_ceil(4)
+}
+
+fn estimate_turn_tokens(role: TurnRole, content: &str, tool_calls: &[ToolCall]) -> usize {
+    TURN_OVERHEAD_TOKENS
+        + estimate_text_tokens(role.as_label())
+        + estimate_text_tokens(content)
+        + tool_calls
+            .iter()
+            .map(|call| {
+                estimate_text_tokens(&call.name) + estimate_text_tokens(&call.arguments_json)
+            })
+            .sum::<usize>()
+}
+
+fn estimate_tool_observation_tokens(tool_name: &str, body: &str) -> usize {
+    TOOL_OBSERVATION_OVERHEAD_TOKENS + estimate_text_tokens(tool_name) + estimate_text_tokens(body)
 }
 
 fn summarize_tool_body(body: &str) -> String {
@@ -421,9 +549,28 @@ mod tests {
     use super::*;
     use crate::llm::{ChatRole, ToolCall};
 
+    fn new_context(limit: usize) -> SessionContext {
+        SessionContext::new(limit, None)
+    }
+
+    fn assert_within_budget(context: &SessionContext) {
+        assert!(
+            context.estimated_tokens() <= context.limit(),
+            "estimated={} limit={} summary={:?} recent_turns={:?}",
+            context.estimated_tokens(),
+            context.limit(),
+            context.summary(),
+            context
+                .recent_turns()
+                .iter()
+                .map(|turn| turn.content())
+                .collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn prunes_old_turns_into_summary() {
-        let mut context = SessionContext::new(40);
+        let mut context = new_context(40);
         context.push_user("one two three four five six");
         context.push_assistant("alpha beta gamma delta epsilon zeta");
         context.push_user("recent");
@@ -436,7 +583,7 @@ mod tests {
 
     #[test]
     fn compacts_old_tool_output_before_recent_turns() {
-        let mut context = SessionContext::new(30);
+        let mut context = new_context(30);
         context.push_tool_output("list", "alpha\nbeta\ngamma\ndelta\nepsilon\nzeta");
         context.push_tool_output("stat", "recent\nraw\noutput");
         context.push_user("what changed?");
@@ -458,7 +605,7 @@ mod tests {
 
     #[test]
     fn compacts_older_tool_outputs_but_keeps_recent_raw_bodies() {
-        let mut context = SessionContext::new(1000);
+        let mut context = new_context(1000);
         context.push_tool_output("t1", "alpha\nbeta\ngamma\ndelta\nepsilon\nzeta");
         context.push_tool_output("t2", "middle\ncontent");
         context.push_tool_output("t3", "recent\nraw\noutput");
@@ -479,7 +626,7 @@ mod tests {
 
     #[test]
     fn keeps_only_tool_output_raw_for_follow_up_questions() {
-        let mut context = SessionContext::new(40);
+        let mut context = new_context(40);
         context.push_tool_output("list", "a\nb\nc\nd\ne\nf");
         context.push_user("what changed?");
 
@@ -490,7 +637,7 @@ mod tests {
 
     #[test]
     fn summary_is_more_compact_than_removed_turns() {
-        let mut context = SessionContext::new(40);
+        let mut context = new_context(40);
         context.push_user("one two three four five six");
         context.push_assistant("alpha beta gamma delta epsilon zeta");
         context.push_user("recent");
@@ -504,7 +651,7 @@ mod tests {
 
     #[test]
     fn keeps_most_recent_tool_output_raw() {
-        let mut context = SessionContext::new(10);
+        let mut context = new_context(10);
         context.push_tool_output("older", "a\nb\nc\nd\ne\nf");
         context.push_tool_output("recent", "one\ntwo\nthree\nfour");
         context.push_user("follow up question");
@@ -529,7 +676,7 @@ mod tests {
 
     #[test]
     fn single_large_turn_may_exceed_budget() {
-        let mut ctx = SessionContext::new(5);
+        let mut ctx = new_context(5);
         // Push a single very long turn so its estimated tokens exceed the limit.
         ctx.push_user("a very very very very very very very long message meant to be large");
         ctx.prune_if_needed();
@@ -540,7 +687,7 @@ mod tests {
 
     #[test]
     fn prune_if_needed_brings_context_within_budget() {
-        let mut context = SessionContext::new(20);
+        let mut context = new_context(20);
         context.push_user("one two three four five six seven eight");
         context.push_assistant("alpha beta gamma delta epsilon zeta eta theta");
         context.push_user("iota kappa lambda mu nu xi omicron pi");
@@ -548,23 +695,12 @@ mod tests {
 
         context.prune_if_needed();
 
-        assert!(
-            context.estimated_tokens() <= context.limit(),
-            "estimated={} limit={} summary={:?} recent_turns={:?}",
-            context.estimated_tokens(),
-            context.limit(),
-            context.summary(),
-            context
-                .recent_turns()
-                .iter()
-                .map(|t| t.content())
-                .collect::<Vec<_>>()
-        );
+        assert_within_budget(&context);
     }
 
     #[test]
     fn prunes_old_compacted_tool_observations_when_still_over_budget() {
-        let mut context = SessionContext::new(24);
+        let mut context = new_context(24);
         context.push_tool_output("list", "a\nb\nc\nd\ne\nf");
         context.push_tool_output("stat", "one\ntwo\nthree\nfour\nfive\nsix");
 
@@ -577,7 +713,7 @@ mod tests {
 
     #[test]
     fn compacts_tool_bodies_idempotently_with_many_observations() {
-        let mut ctx = SessionContext::new(40);
+        let mut ctx = new_context(40);
         ctx.push_tool_output("t1", "one\ntwo\nthree\nfour");
         ctx.push_tool_output("t2", "a\nb\nc\nd");
         ctx.push_tool_output("t3", "alpha\nbeta\ngamma\ndelta");
@@ -607,7 +743,7 @@ mod tests {
 
     #[test]
     fn chat_request_interleaves_assistant_tool_calls_and_tool_results() {
-        let mut context = SessionContext::new(512);
+        let mut context = new_context(512);
         context.push_user("show src");
         context
             .push_assistant_tool_call(&ToolCall {
@@ -632,5 +768,49 @@ mod tests {
                 .map(|call| call.function.name.as_str()),
             Some("fs")
         );
+    }
+
+    #[test]
+    fn stored_messages_include_token_usage_metadata() {
+        let mut context = new_context(512);
+        context.push_user("hello glass");
+        context.push_assistant("hi there");
+        context.push_tool_output("fs", "src/main.rs");
+
+        let user_debug = format!("{:?}", &context.recent_turns()[0]);
+        let assistant_debug = format!("{:?}", &context.recent_turns()[1]);
+        let tool_debug = format!("{:?}", &context.tool_observations()[0]);
+
+        assert!(user_debug.contains("estimated_tokens"));
+        assert!(assistant_debug.contains("estimated_tokens"));
+        assert!(tool_debug.contains("estimated_tokens"));
+    }
+
+    #[test]
+    fn chat_request_places_configured_system_prompt_before_summary() {
+        let mut context = SessionContext::new(20, Some("Follow repo conventions.".into()));
+        context.push_user("one two three four five six seven eight");
+        context.push_assistant("alpha beta gamma delta epsilon zeta eta theta");
+        context.push_user("ok");
+        context.prune_if_needed();
+
+        let request = context.chat_request().unwrap();
+
+        assert_eq!(request.messages[0].role, ChatRole::System);
+        assert_eq!(request.messages[0].content, "Follow repo conventions.");
+        assert_eq!(request.messages[1].role, ChatRole::System);
+        assert!(
+            request.messages[1]
+                .content
+                .starts_with("Conversation summary:\n")
+        );
+    }
+
+    #[test]
+    fn configured_system_prompt_counts_toward_estimated_tokens() {
+        let without_prompt = SessionContext::new(64, None);
+        let with_prompt = SessionContext::new(64, Some("Follow repo conventions.".into()));
+
+        assert!(with_prompt.estimated_tokens_total() > without_prompt.estimated_tokens_total());
     }
 }

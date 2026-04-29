@@ -5,28 +5,25 @@ use anyhow::Result;
 use crate::llm::{ToolCall, ToolDefinition};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ToolResult {
-    Text { preview: String, body: String },
+pub struct ToolResult {
+    preview: String,
+    body: String,
 }
 
 impl ToolResult {
     pub fn text(preview: impl Into<String>, body: impl Into<String>) -> Self {
-        Self::Text {
+        Self {
             preview: preview.into(),
             body: body.into(),
         }
     }
 
     pub fn preview(&self) -> &str {
-        match self {
-            Self::Text { preview, .. } => preview,
-        }
+        &self.preview
     }
 
     pub fn body(&self) -> &str {
-        match self {
-            Self::Text { body, .. } => body,
-        }
+        &self.body
     }
 }
 

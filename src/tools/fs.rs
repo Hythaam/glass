@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
+use std::fmt::Display;
 use std::ffi::OsString;
 use std::fs;
 use std::io::ErrorKind;
@@ -25,12 +26,8 @@ impl FsTool {
     pub fn read_file(&self, input: &str) -> Result<ToolResult> {
         let path = self.resolve(input)?;
         // Read raw bytes first so we can return a clearer error when the file isn't valid UTF-8.
-        let bytes = fs::read(&path).with_context(|| {
-            format!(
-                "failed to read file '{input}' inside startup directory '{}'",
-                self.root.display()
-            )
-        })?;
+        let bytes = fs::read(&path)
+            .with_context(|| self.inside_startup_dir(format!("failed to read file '{input}'")))?;
 
         let body = String::from_utf8(bytes).map_err(|_| {
             anyhow!(
@@ -47,16 +44,10 @@ impl FsTool {
         let mut lines = Vec::new();
 
         for entry in fs::read_dir(&path).with_context(|| {
-            format!(
-                "failed to list directory '{input}' inside startup directory '{}'",
-                self.root.display()
-            )
+            self.inside_startup_dir(format!("failed to list directory '{input}'"))
         })? {
             let entry = entry.with_context(|| {
-                format!(
-                    "failed to read an entry from directory '{input}' inside startup directory '{}'",
-                    self.root.display()
-                )
+                self.inside_startup_dir(format!("failed to read an entry from directory '{input}'"))
             })?;
             lines.push(entry.file_name().to_string_lossy().to_string());
         }
@@ -84,53 +75,33 @@ impl FsTool {
         let candidate = self.root.join(&relative);
         let resolved = self.resolve_existing_prefix(&candidate)?;
 
-        if !resolved.starts_with(&self.root) {
-            return Err(anyhow!(
-                "path '{input}' escapes the startup directory '{}'",
-                self.root.display()
-            ));
-        }
+        self.ensure_within_root(&resolved, input)?;
 
         match fs::symlink_metadata(&candidate) {
             Ok(_) => {
                 let final_path = candidate.canonicalize().with_context(|| {
-                    format!(
-                        "failed to resolve '{input}' inside startup directory '{}'",
-                        self.root.display()
-                    )
+                    self.inside_startup_dir(format!("failed to resolve '{input}'"))
                 })?;
-                if !final_path.starts_with(&self.root) {
-                    return Err(anyhow!(
-                        "path '{input}' escapes the startup directory '{}'",
-                        self.root.display()
-                    ));
-                }
+                self.ensure_within_root(&final_path, input)?;
                 Ok(final_path)
             }
             Err(error) if error.kind() == ErrorKind::NotFound => Ok(resolved),
-            Err(error) => Err(error).with_context(|| {
-                format!(
-                    "failed to inspect '{input}' inside startup directory '{}'",
-                    self.root.display()
-                )
-            }),
+            Err(error) => Err(error)
+                .with_context(|| self.inside_startup_dir(format!("failed to inspect '{input}'"))),
         }
     }
 
     fn normalize_relative_path(&self, input: &str) -> Result<PathBuf> {
         if input.is_empty() {
             return Err(anyhow!(
-                "path is empty; provide a file or directory path inside the startup directory '{}'",
-                self.root.display()
+                "path is empty; provide a file or directory path inside {}",
+                self.startup_dir_label()
             ));
         }
 
         let path = Path::new(input);
         if path.is_absolute() {
-            return Err(anyhow!(
-                "path '{input}' must stay inside the startup directory '{}'",
-                self.root.display()
-            ));
+            return Err(anyhow!("{}", self.must_stay_inside_root(input)));
         }
 
         let mut normalized = PathBuf::new();
@@ -139,10 +110,7 @@ impl FsTool {
                 Component::Normal(part) => normalized.push(part),
                 Component::CurDir => {}
                 Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
-                    return Err(anyhow!(
-                        "path '{input}' must stay inside the startup directory '{}'",
-                        self.root.display()
-                    ));
+                    return Err(anyhow!("{}", self.must_stay_inside_root(input)));
                 }
             }
         }
@@ -158,11 +126,10 @@ impl FsTool {
             match fs::symlink_metadata(current) {
                 Ok(_) => {
                     let mut resolved = current.canonicalize().with_context(|| {
-                        format!(
-                            "failed to resolve '{current}' inside startup directory '{root}'",
-                            root = self.root.display(),
-                            current = current.display()
-                        )
+                        self.inside_startup_dir(format!(
+                            "failed to resolve '{}'",
+                            current.display()
+                        ))
                     })?;
                     for component in suffix.iter().rev() {
                         resolved.push(component);
@@ -172,31 +139,55 @@ impl FsTool {
                 Err(error) if error.kind() == ErrorKind::NotFound => {
                     let name = current.file_name().ok_or_else(|| {
                         anyhow!(
-                            "path '{}' must stay inside the startup directory '{}'",
-                            path.display(),
-                            self.root.display()
+                            "{}",
+                            self.must_stay_inside_root(&path.display().to_string())
                         )
                     })?;
                     suffix.push(name.to_os_string());
                     current = current.parent().ok_or_else(|| {
                         anyhow!(
-                            "path '{}' must stay inside the startup directory '{}'",
-                            path.display(),
-                            self.root.display()
+                            "{}",
+                            self.must_stay_inside_root(&path.display().to_string())
                         )
                     })?;
                 }
                 Err(error) => {
                     return Err(error).with_context(|| {
-                        format!(
-                            "failed to inspect '{}' inside startup directory '{}'",
-                            current.display(),
-                            self.root.display()
-                        )
+                        self.inside_startup_dir(format!(
+                            "failed to inspect '{}'",
+                            current.display()
+                        ))
                     });
                 }
             }
         }
+    }
+
+    fn ensure_within_root(&self, path: &Path, input: &str) -> Result<()> {
+        if path.starts_with(&self.root) {
+            Ok(())
+        } else {
+            Err(anyhow!("{}", self.escapes_root(input)))
+        }
+    }
+
+    fn inside_startup_dir(&self, detail: String) -> String {
+        format!("{detail} inside {}", self.startup_dir_label())
+    }
+
+    fn startup_dir_label(&self) -> String {
+        format!("startup directory '{}'", self.root.display())
+    }
+
+    fn escapes_root(&self, input: &str) -> String {
+        format!("path '{input}' escapes {}", self.startup_dir_label())
+    }
+
+    fn must_stay_inside_root(&self, input: impl Display) -> String {
+        format!(
+            "path '{input}' must stay inside {}",
+            self.startup_dir_label()
+        )
     }
 }
 
@@ -205,6 +196,19 @@ impl FsTool {
 enum FsToolArguments {
     ReadFile { path: String },
     ListDir { path: String },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum FsToolArgumentShape {
+    Tagged(FsToolArguments),
+    Nested { args: FsPathOnlyArguments },
+    PathOnly(FsPathOnlyArguments),
+}
+
+#[derive(Debug, Deserialize)]
+struct FsPathOnlyArguments {
+    path: String,
 }
 
 impl ToolExecutor for FsTool {
@@ -216,36 +220,18 @@ impl ToolExecutor for FsTool {
                 description: "Read files and directories inside the startup directory".into(),
                 parameters: json!({
                     "type": "object",
-                    "oneOf": [
-                        {
-                            "type": "object",
-                            "properties": {
-                                "op": {
-                                    "type": "string",
-                                    "enum": ["read_file"]
-                                },
-                                "path": {
-                                    "type": "string",
-                                    "description": "Relative path to a UTF-8 text file inside the startup directory"
-                                }
-                            },
-                            "required": ["op", "path"]
+                    "properties": {
+                        "op": {
+                            "type": "string",
+                            "enum": ["read_file", "list_dir"],
+                            "description": "Operation to run. Use read_file for UTF-8 text files and list_dir for directories."
                         },
-                        {
-                            "type": "object",
-                            "properties": {
-                                "op": {
-                                    "type": "string",
-                                    "enum": ["list_dir"]
-                                },
-                                "path": {
-                                    "type": "string",
-                                    "description": "Relative path to a directory inside the startup directory"
-                                }
-                            },
-                            "required": ["op", "path"]
+                        "path": {
+                            "type": "string",
+                            "description": "Relative path inside the startup directory"
                         }
-                    ]
+                    },
+                    "required": ["op", "path"]
                 }),
             },
         }]
@@ -256,7 +242,8 @@ impl ToolExecutor for FsTool {
             return Err(anyhow!("unsupported tool '{}'", call.name));
         }
 
-        let arguments: FsToolArguments = serde_json::from_str(&call.arguments_json)
+        let arguments = self
+            .parse_arguments(&call.arguments_json)
             .with_context(|| format!("invalid arguments for tool '{}'", call.name))?;
 
         match arguments {
@@ -266,64 +253,95 @@ impl ToolExecutor for FsTool {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::tools::ToolResult;
-    use std::fs;
-    use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    /// RAII guard to ensure test directories are removed even if a test panics.
-    struct TestDirGuard(PathBuf);
-    impl Drop for TestDirGuard {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+impl FsTool {
+    fn parse_arguments(&self, raw: &str) -> Result<FsToolArguments> {
+        let value: Value = serde_json::from_str(raw)?;
+        if value.get("op").is_some() {
+            return serde_json::from_value(value).map_err(Into::into);
         }
-    }
 
-    #[test]
-    fn rejects_escape_outside_root() {
-        let tool = FsTool::new(std::env::current_dir().unwrap()).unwrap();
-        let error = tool.read_file("../../etc/passwd").unwrap_err().to_string();
-        assert!(error.contains("startup directory"));
-    }
-
-    #[test]
-    fn rejects_absolute_paths() {
-        let tool = FsTool::new(std::env::current_dir().unwrap()).unwrap();
-        let error = tool.read_file("/etc/passwd").unwrap_err().to_string();
-        assert!(error.contains("startup directory"));
-    }
-
-    #[test]
-    fn reads_file_contents() {
-        let root = test_root("read");
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
-        let _guard = TestDirGuard(root.clone());
-        fs::write(root.join("note.txt"), "hello\nworld").unwrap();
-
-        let tool = FsTool::new(root.clone()).unwrap();
-        let result = tool.read_file("note.txt").unwrap();
-
-        match result {
-            ToolResult::Text { preview, body } => {
-                assert_eq!(preview, "hello");
-                assert_eq!(body, "hello\nworld");
+        let shape: FsToolArgumentShape = serde_json::from_value(value)?;
+        match shape {
+            FsToolArgumentShape::Tagged(arguments) => Ok(arguments),
+            FsToolArgumentShape::Nested { args } | FsToolArgumentShape::PathOnly(args) => {
+                self.infer_operation_from_path(args.path)
             }
         }
     }
 
+    fn infer_operation_from_path(&self, path: String) -> Result<FsToolArguments> {
+        let resolved = self.resolve(&path)?;
+        let metadata = fs::metadata(&resolved).with_context(|| {
+            format!(
+                "failed to inspect '{path}' inside startup directory '{}'",
+                self.root.display()
+            )
+        })?;
+
+        if metadata.is_dir() {
+            return Ok(FsToolArguments::ListDir { path });
+        }
+
+        if metadata.is_file() {
+            return Ok(FsToolArguments::ReadFile { path });
+        }
+
+        Err(anyhow!(
+            "path '{path}' is neither a regular file nor a directory inside startup directory '{}'",
+            self.root.display()
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::fs::TestDir;
+    use crate::tools::ToolResult;
+
+    fn startup_tool() -> FsTool {
+        FsTool::new(std::env::current_dir().unwrap()).unwrap()
+    }
+
+    fn tool_for(root: &TestDir) -> FsTool {
+        FsTool::new(root.path().to_path_buf()).unwrap()
+    }
+
+    fn assert_text_result(result: ToolResult, expected_preview: &str, expected_body: &str) {
+        assert_eq!(result.preview(), expected_preview);
+        assert_eq!(result.body(), expected_body);
+    }
+
+    #[test]
+    fn rejects_paths_outside_root() {
+        let tool = startup_tool();
+
+        for path in ["../../etc/passwd", "/etc/passwd"] {
+            let error = tool.read_file(path).unwrap_err().to_string();
+            assert!(
+                error.contains("startup directory"),
+                "path={path} error={error}"
+            );
+        }
+    }
+
+    #[test]
+    fn reads_file_contents() {
+        let root = TestDir::new("fs-read");
+        root.write_text("note.txt", "hello\nworld");
+
+        let tool = tool_for(&root);
+        let result = tool.read_file("note.txt").unwrap();
+
+        assert_text_result(result, "hello", "hello\nworld");
+    }
+
     #[test]
     fn lists_directory_entries() {
-        let root = test_root("list");
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(root.join("nested")).unwrap();
-        let _guard = TestDirGuard(root.clone());
-        fs::write(root.join("nested").join("file.txt"), "hello").unwrap();
+        let root = TestDir::new("fs-list");
+        root.write_text("nested/file.txt", "hello");
 
-        let tool = FsTool::new(root.clone()).unwrap();
+        let tool = tool_for(&root);
         let result = tool.list_dir("nested").unwrap();
         let body = text_body(&result);
         assert!(body.contains("file.txt"));
@@ -331,30 +349,21 @@ mod tests {
 
     #[test]
     fn rejects_symlink_target_outside_root() {
-        let root = test_root("symlink");
-        let outside = test_root("outside");
-        let _ = fs::remove_dir_all(&root);
-        let _ = fs::remove_dir_all(&outside);
-        fs::create_dir_all(&root).unwrap();
-        fs::create_dir_all(&outside).unwrap();
-        let _root_guard = TestDirGuard(root.clone());
-        let _outside_guard = TestDirGuard(outside.clone());
-        fs::write(outside.join("secret.txt"), "secret").unwrap();
-        std::os::unix::fs::symlink(outside.join("secret.txt"), root.join("escape.txt")).unwrap();
+        let root = TestDir::new("fs-symlink");
+        let outside = TestDir::new("fs-outside");
+        outside.write_text("secret.txt", "secret");
+        std::os::unix::fs::symlink(outside.child("secret.txt"), root.child("escape.txt")).unwrap();
 
-        let tool = FsTool::new(root.clone()).unwrap();
+        let tool = tool_for(&root);
         let error = tool.read_file("escape.txt").unwrap_err().to_string();
         assert!(error.contains("startup directory"));
     }
 
     #[test]
     fn missing_file_error_has_context() {
-        let root = test_root("missing-file");
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
-        let _guard = TestDirGuard(root.clone());
+        let root = TestDir::new("fs-missing-file");
 
-        let tool = FsTool::new(root.clone()).unwrap();
+        let tool = tool_for(&root);
         let error = tool.read_file("missing.txt").unwrap_err().to_string();
         assert!(error.contains("failed to read file 'missing.txt'"));
         assert!(error.contains("startup directory"));
@@ -362,12 +371,9 @@ mod tests {
 
     #[test]
     fn missing_directory_error_has_context() {
-        let root = test_root("missing-dir");
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
-        let _guard = TestDirGuard(root.clone());
+        let root = TestDir::new("fs-missing-dir");
 
-        let tool = FsTool::new(root.clone()).unwrap();
+        let tool = tool_for(&root);
         let error = tool.list_dir("missing").unwrap_err().to_string();
         assert!(error.contains("failed to list directory 'missing'"));
         assert!(error.contains("startup directory"));
@@ -375,13 +381,10 @@ mod tests {
 
     #[test]
     fn listing_file_error_has_context() {
-        let root = test_root("list-file");
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
-        let _guard = TestDirGuard(root.clone());
-        fs::write(root.join("note.txt"), "hello").unwrap();
+        let root = TestDir::new("fs-list-file");
+        root.write_text("note.txt", "hello");
 
-        let tool = FsTool::new(root.clone()).unwrap();
+        let tool = tool_for(&root);
         let error = tool.list_dir("note.txt").unwrap_err().to_string();
         assert!(error.contains("failed to list directory 'note.txt'"));
         assert!(error.contains("startup directory"));
@@ -389,41 +392,32 @@ mod tests {
 
     #[test]
     fn rejects_missing_startup_root() {
-        let root = test_root("missing-root");
-        let error = FsTool::new(root.clone()).unwrap_err().to_string();
+        let root = TestDir::new("fs-missing-root");
+        let path = root.path().to_path_buf();
+        drop(root);
+        let error = FsTool::new(path.clone()).unwrap_err().to_string();
         assert!(error.contains("failed to resolve startup directory"));
-        assert!(error.contains(&root.display().to_string()));
+        assert!(error.contains(&path.display().to_string()));
     }
 
     #[test]
     fn reads_in_root_symlink_target() {
-        let root = test_root("symlink-in-root");
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(root.join("nested")).unwrap();
-        let _guard = TestDirGuard(root.clone());
-        fs::write(root.join("nested").join("file.txt"), "hello").unwrap();
-        std::os::unix::fs::symlink(root.join("nested").join("file.txt"), root.join("link.txt"))
-            .unwrap();
+        let root = TestDir::new("fs-symlink-in-root");
+        root.write_text("nested/file.txt", "hello");
+        std::os::unix::fs::symlink(root.child("nested/file.txt"), root.child("link.txt")).unwrap();
 
-        let tool = FsTool::new(root.clone()).unwrap();
+        let tool = tool_for(&root);
         let result = tool.read_file("link.txt").unwrap();
 
-        match result {
-            ToolResult::Text { preview, body } => {
-                assert_eq!(preview, "hello");
-                assert_eq!(body, "hello");
-            }
-        }
+        assert_text_result(result, "hello", "hello");
     }
 
     #[test]
     fn reading_directory_error_has_context() {
-        let root = test_root("read-dir");
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(root.join("nested")).unwrap();
-        let _guard = TestDirGuard(root.clone());
+        let root = TestDir::new("fs-read-dir");
+        root.create_dir_all("nested");
 
-        let tool = FsTool::new(root.clone()).unwrap();
+        let tool = tool_for(&root);
         let error = tool.read_file("nested").unwrap_err().to_string();
         assert!(error.contains("failed to read file 'nested'"));
         assert!(error.contains("startup directory"));
@@ -431,32 +425,80 @@ mod tests {
 
     #[test]
     fn invalid_utf8_returns_distinct_error() {
-        let root = test_root("invalid-utf8");
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
-        let _guard = TestDirGuard(root.clone());
-        fs::write(root.join("binary.dat"), vec![0xff, 0xfe, 0xfd]).unwrap();
+        let root = TestDir::new("fs-invalid-utf8");
+        root.write_bytes("binary.dat", &[0xff, 0xfe, 0xfd]);
 
-        let tool = FsTool::new(root.clone()).unwrap();
+        let tool = tool_for(&root);
         let error = tool.read_file("binary.dat").unwrap_err().to_string();
         assert!(error.contains("contains invalid UTF-8"));
     }
 
-    fn text_body(result: &ToolResult) -> &str {
-        match result {
-            ToolResult::Text { body, .. } => body,
-        }
+    #[test]
+    fn execute_infers_list_dir_when_op_is_missing() {
+        let root = TestDir::new("fs-infer-list-dir");
+        root.write_text("nested/file.txt", "hello");
+
+        let mut tool = tool_for(&root);
+        let result = tool
+            .execute(&ToolCall {
+                name: "fs".into(),
+                arguments_json: r#"{"path":"nested"}"#.into(),
+            })
+            .unwrap();
+
+        assert!(text_body(&result).contains("file.txt"));
     }
 
-    fn test_root(name: &str) -> PathBuf {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::current_dir()
-            .unwrap()
-            .join("target")
-            .join("test-artifacts")
-            .join(format!("glass-fs-{name}-{unique}"))
+    #[test]
+    fn execute_infers_read_file_when_op_is_missing() {
+        let root = TestDir::new("fs-infer-read-file");
+        root.write_text("note.txt", "hello\nworld");
+
+        let mut tool = tool_for(&root);
+        let result = tool
+            .execute(&ToolCall {
+                name: "fs".into(),
+                arguments_json: r#"{"path":"note.txt"}"#.into(),
+            })
+            .unwrap();
+
+        assert_eq!(text_body(&result), "hello\nworld");
+    }
+
+    #[test]
+    fn execute_unwraps_nested_args_payload() {
+        let root = TestDir::new("fs-nested-args");
+        root.write_text("nested/file.txt", "hello");
+
+        let mut tool = FsTool::new(root.path().to_path_buf()).unwrap();
+        let result = tool
+            .execute(&ToolCall {
+                name: "fs".into(),
+                arguments_json: r#"{"args":{"path":"nested"}}"#.into(),
+            })
+            .unwrap();
+
+        assert!(text_body(&result).contains("file.txt"));
+    }
+
+    #[test]
+    fn execute_rejects_unknown_op_even_when_path_can_be_inferred() {
+        let root = TestDir::new("fs-unknown-op");
+        root.write_text("nested/file.txt", "hello");
+
+        let mut tool = tool_for(&root);
+        let error = tool
+            .execute(&ToolCall {
+                name: "fs".into(),
+                arguments_json: r#"{"op":"bogus","path":"nested"}"#.into(),
+            })
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("invalid arguments for tool 'fs'"));
+    }
+
+    fn text_body(result: &ToolResult) -> &str {
+        result.body()
     }
 }
