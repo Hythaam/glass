@@ -2,7 +2,7 @@ use std::path::Path;
 
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Style};
-use ratatui::widgets::{Block, Borders};
+use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 const STATUS_BAR_HEIGHT: u16 = 1;
 const TOOL_FOLD_LINE_THRESHOLD: usize = 4;
@@ -26,6 +26,16 @@ pub(crate) fn composer_block(startup_dir: &Path, turn_in_flight: bool) -> Block<
 
 pub(crate) fn composer_inner_area(startup_dir: &Path, turn_in_flight: bool, area: Rect) -> Rect {
     composer_block(startup_dir, turn_in_flight).inner(area)
+}
+
+pub(crate) fn composer_paragraph(
+    composer: impl Into<ratatui::text::Text<'static>>,
+    startup_dir: &Path,
+    turn_in_flight: bool,
+) -> Paragraph<'static> {
+    Paragraph::new(composer)
+        .block(composer_block(startup_dir, turn_in_flight))
+        .wrap(Wrap { trim: false })
 }
 
 pub(crate) fn composer_cursor_position(
@@ -122,6 +132,68 @@ pub(crate) fn wrap_plain_text(text: &str, width: usize) -> Vec<String> {
     wrapped
 }
 
+pub(crate) fn wrap_composer_text(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut wrapped = Vec::new();
+
+    for raw_line in text.split('\n') {
+        if raw_line.is_empty() {
+            wrapped.push(String::new());
+            continue;
+        }
+
+        let mut remaining = raw_line.chars().collect::<Vec<_>>();
+        while !remaining.is_empty() {
+            let mut line_width = 0usize;
+            let mut last_word_end = 0usize;
+            let mut prev_whitespace = false;
+            let mut overflow = false;
+
+            for index in 0..remaining.len() {
+                let character = remaining[index];
+                let is_whitespace = character.is_whitespace();
+                if is_whitespace && !prev_whitespace {
+                    last_word_end = index;
+                }
+
+                line_width += 1;
+                if line_width > width {
+                    let break_at = if last_word_end != 0 {
+                        last_word_end
+                    } else {
+                        index
+                    };
+                    wrapped.push(remaining[..break_at].iter().collect());
+                    let mut rest = remaining[break_at..].to_vec();
+                    if let Some(non_whitespace) =
+                        rest.iter().position(|character| !character.is_whitespace())
+                    {
+                        rest.drain(..non_whitespace);
+                    } else {
+                        rest.clear();
+                    }
+                    remaining = rest;
+                    overflow = true;
+                    break;
+                }
+
+                prev_whitespace = is_whitespace;
+            }
+
+            if !overflow {
+                wrapped.push(remaining.iter().collect());
+                remaining.clear();
+            }
+        }
+    }
+
+    if wrapped.is_empty() {
+        wrapped.push(String::new());
+    }
+
+    wrapped
+}
+
 fn truncate_rightmost(text: &str, width: usize) -> String {
     text.chars().take(width).collect()
 }
@@ -137,7 +209,7 @@ fn truncate_leftmost(text: &str, width: usize) -> String {
 
 fn composer_cursor(composer: &str, width: usize) -> (u16, u16) {
     let width = width.max(1);
-    let wrapped = wrap_plain_text(composer, width);
+    let wrapped = wrap_composer_text(composer, width);
     let row = wrapped.len().saturating_sub(1) as u16;
     let col = wrapped
         .last()

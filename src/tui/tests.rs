@@ -8,6 +8,7 @@ use ratatui::layout::Rect;
 use ratatui::style::Color;
 use ratatui::widgets::Paragraph;
 
+use crate::agent::HarnessCommand;
 use crate::agent::{AgentEvent, AgentStatus};
 use crate::context::SessionContext;
 use crate::llm::RequestTokenUsage;
@@ -15,7 +16,7 @@ use crate::test_support::fakes::{FakeProvider, FakeTools};
 
 use super::{
     TranscriptState, TuiAction, TuiApp, TuiState, composer_block, composer_cursor_position,
-    layout_chunks, transcript_inner_size,
+    composer_paragraph, layout_chunks, transcript_inner_size,
 };
 
 #[test]
@@ -167,6 +168,14 @@ fn composer_visual_lines_counts_soft_wrapped_single_line() {
 }
 
 #[test]
+fn composer_visual_lines_follow_whitespace_wrapping() {
+    let mut state = TuiState::default();
+    state.composer_mut().push_str("a     b");
+
+    assert_eq!(state.composer_visual_lines(3), 2);
+}
+
+#[test]
 fn composer_height_grows_with_wrapped_visual_lines() {
     let mut state = TuiState::default();
     state.composer_mut().push_str("abcdefghij");
@@ -192,8 +201,11 @@ fn draw_positions_composer_cursor_using_block_inner_area() {
 
     terminal
         .draw(|frame| {
-            let composer = Paragraph::new(state.composer())
-                .block(composer_block(PathBuf::from(".").as_path(), false));
+            let composer = composer_paragraph(
+                state.composer().to_string(),
+                PathBuf::from(".").as_path(),
+                false,
+            );
             frame.render_widget(composer, composer_area);
         })
         .unwrap();
@@ -210,6 +222,64 @@ fn draw_positions_composer_cursor_using_block_inner_area() {
     let last_character = find_symbol(&buffer, composer_area, "g").unwrap();
 
     assert_eq!(actual_cursor, (last_character.0 + 1, last_character.1));
+}
+
+#[test]
+fn draw_positions_composer_cursor_after_whitespace_wrap() {
+    let mut state = TuiState::default();
+    state.composer_mut().push_str("aa bbb c");
+    let composer_area = Rect::new(0, 0, 6, 4);
+    let backend = TestBackend::new(6, 6);
+    let mut terminal = Terminal::new(backend).unwrap();
+
+    terminal
+        .draw(|frame| {
+            let composer = composer_paragraph(
+                state.composer().to_string(),
+                PathBuf::from(".").as_path(),
+                false,
+            );
+            frame.render_widget(composer, composer_area);
+        })
+        .unwrap();
+
+    let actual_cursor = composer_cursor_position(
+        state.composer(),
+        PathBuf::from(".").as_path(),
+        false,
+        composer_area,
+    )
+    .unwrap();
+
+    let buffer = terminal.backend().buffer().clone();
+    let last_character = find_symbol(&buffer, composer_area, "c").unwrap();
+
+    assert_eq!(actual_cursor, (last_character.0 + 1, last_character.1));
+}
+
+#[test]
+fn composer_renders_soft_wrapped_text_on_following_line() {
+    let mut state = TuiState::default();
+    state.composer_mut().push_str("abcdefgh");
+    let composer_area = Rect::new(0, 0, 4, 4);
+    let backend = TestBackend::new(4, 6);
+    let mut terminal = Terminal::new(backend).unwrap();
+
+    terminal
+        .draw(|frame| {
+            let composer = composer_paragraph(
+                state.composer().to_string(),
+                PathBuf::from(".").as_path(),
+                false,
+            );
+            frame.render_widget(composer, composer_area);
+        })
+        .unwrap();
+
+    let buffer = terminal.backend().buffer().clone();
+    let wrapped_character = find_symbol(&buffer, composer_area, "e");
+
+    assert_eq!(wrapped_character, Some((0, 2)));
 }
 
 #[test]
@@ -230,12 +300,29 @@ fn enter_does_not_submit_while_turn_is_in_flight() {
     state.apply_agent_event(AgentEvent::ToolStarted {
         turn_id: 9,
         tool_name: "fs".into(),
+        arguments: r#"{"op":"list_dir","path":"src"}"#.into(),
     });
 
     let action = state.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
     assert_eq!(action, TuiAction::None);
     assert_eq!(state.composer(), "hello again");
+}
+
+#[test]
+fn exit_command_still_submits_while_turn_is_in_flight() {
+    let mut state = TuiState::default();
+    state.composer_mut().push_str("/exit");
+    state.apply_agent_event(AgentEvent::ToolStarted {
+        turn_id: 9,
+        tool_name: "fs".into(),
+        arguments: r#"{"op":"list_dir","path":"src"}"#.into(),
+    });
+
+    let action = state.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    assert_eq!(action, TuiAction::Submit("/exit".into()));
+    assert_eq!(state.composer(), "");
 }
 
 #[test]
@@ -273,12 +360,27 @@ fn transcript_state_renders_assistant_turns_directly() {
 }
 
 #[test]
+fn completed_thinking_block_starts_folded_and_toggles_open() {
+    let mut state = TuiState::default();
+
+    state.apply_agent_event(AgentEvent::ThinkingDelta {
+        turn_id: 31,
+        text: "pondering\nline2\nline3\nline4\nmore detail".into(),
+    });
+    state.apply_agent_event(AgentEvent::ThinkingDone { turn_id: 31 });
+
+    assert!(state.transcript().text()[0].contains("Thinking: pondering"));
+    assert!(state.transcript_mut().toggle_tool_output_at_line(0, 40));
+    assert!(state.transcript().text()[0].contains("more detail"));
+}
+
+#[test]
 fn long_tool_output_starts_folded_and_toggles_from_preview_line() {
     let mut state = TuiState::default();
 
     emit_tool_output(&mut state, 3, "src entries", false);
 
-    assert!(state.transcript().text()[0].contains("src entries"));
+    assert!(state.transcript().text()[0].contains(r#"{"op":"list_dir","path":"src"}"#));
     assert!(state.transcript().tool_output_is_folded(0));
 
     assert!(state.transcript_mut().toggle_tool_output_at_line(0, 40));
@@ -355,6 +457,7 @@ fn finished_tool_output_replaces_running_status() {
     state.apply_agent_event(AgentEvent::ToolStarted {
         turn_id: 11,
         tool_name: "fs".into(),
+        arguments: r#"{"op":"list_dir","path":"src"}"#.into(),
     });
     state.apply_agent_event(AgentEvent::ToolOutputDelta {
         turn_id: 11,
@@ -369,7 +472,7 @@ fn finished_tool_output_replaces_running_status() {
 
     let transcript = state.transcript().text();
     assert_eq!(transcript.len(), 1);
-    assert!(transcript[0].contains("Tool fs: 1 entry"));
+    assert!(transcript[0].contains(r#"Tool fs: {"op":"list_dir","path":"src"}"#));
     assert!(transcript[0].contains("main.rs"));
     assert!(!transcript[0].contains("running"));
 }
@@ -378,7 +481,11 @@ fn finished_tool_output_replaces_running_status() {
 fn append_tool_output_reuses_existing_output_entry() {
     let mut state = TuiState::default();
 
-    state.transcript_mut().start_tool(12, "fs".into());
+    state.transcript_mut().start_tool(
+        12,
+        "fs".into(),
+        r#"{"op":"read_file","path":"src/main.rs"}"#.into(),
+    );
     state
         .transcript_mut()
         .append_tool_output(12, "fs".into(), "main.rs\n".into());
@@ -388,6 +495,7 @@ fn append_tool_output_reuses_existing_output_entry() {
 
     let transcript = state.transcript().text();
     assert_eq!(transcript.len(), 1);
+    assert!(transcript[0].contains(r#"Tool fs: {"op":"read_file","path":"src/main.rs"}"#));
     assert!(transcript[0].contains("main.rs"));
     assert!(transcript[0].contains("tui.rs"));
 }
@@ -396,7 +504,9 @@ fn append_tool_output_reuses_existing_output_entry() {
 fn finish_tool_output_updates_preview_and_fold_state() {
     let mut state = TuiState::default();
 
-    state.transcript_mut().start_tool(13, "fs".into());
+    state
+        .transcript_mut()
+        .start_tool(13, "fs".into(), r#"{"op":"list_dir","path":"src"}"#.into());
     state.transcript_mut().append_tool_output(
         13,
         "fs".into(),
@@ -408,7 +518,7 @@ fn finish_tool_output_updates_preview_and_fold_state() {
 
     let transcript = state.transcript().text();
     assert_eq!(transcript.len(), 1);
-    assert!(transcript[0].contains("Tool fs: src entries"));
+    assert!(transcript[0].contains(r#"Tool fs: {"op":"list_dir","path":"src"}"#));
     assert!(state.transcript().tool_output_is_folded(0));
 }
 
@@ -438,6 +548,57 @@ fn transcript_auto_scrolls_to_latest_agent_output() {
     state.transcript_mut().clamp_scroll(40, 2);
 
     assert!(state.transcript().scroll() > 0);
+}
+
+#[test]
+fn reset_session_clears_transcript_composer_and_inflight_state() {
+    let mut state = TuiState::default();
+    state.composer_mut().push_str("draft");
+    state.apply_agent_event(AgentEvent::ToolStarted {
+        turn_id: 44,
+        tool_name: "fs".into(),
+        arguments: r#"{"op":"list_dir","path":"src"}"#.into(),
+    });
+    state.apply_agent_event(AgentEvent::TurnError {
+        turn_id: 44,
+        message: "provider down".into(),
+    });
+
+    state.reset_session();
+
+    assert_eq!(state.composer(), "");
+    assert!(!state.is_turn_in_flight());
+    assert!(state.transcript().text().is_empty());
+}
+
+#[test]
+fn app_new_session_command_clears_visible_session_state() {
+    let mut app = test_app();
+    app.state_mut().composer_mut().push_str("draft");
+    app.state_mut().apply_agent_event(AgentEvent::ToolStarted {
+        turn_id: 51,
+        tool_name: "fs".into(),
+        arguments: r#"{"op":"list_dir","path":"src"}"#.into(),
+    });
+    app.state_mut().apply_agent_event(AgentEvent::TurnError {
+        turn_id: 51,
+        message: "provider down".into(),
+    });
+
+    app.apply_harness_command_for_test(HarnessCommand::NewSession);
+
+    assert_eq!(app.state().composer(), "");
+    assert!(!app.state().is_turn_in_flight());
+    assert!(app.state().transcript().text().is_empty());
+}
+
+#[test]
+fn app_exit_command_marks_app_for_exit() {
+    let mut app = test_app();
+
+    app.apply_harness_command_for_test(HarnessCommand::Exit);
+
+    assert!(app.should_exit_for_test());
 }
 
 #[test]
@@ -563,6 +724,7 @@ fn emit_tool_output(state: &mut TuiState, turn_id: u64, preview: &str, complete_
     state.apply_agent_event(AgentEvent::ToolStarted {
         turn_id,
         tool_name: "fs".into(),
+        arguments: r#"{"op":"list_dir","path":"src"}"#.into(),
     });
     state.apply_agent_event(AgentEvent::ToolOutputDelta {
         turn_id,

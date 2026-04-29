@@ -8,6 +8,13 @@ use crate::tools::ToolExecutor;
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentEvent {
+    ThinkingDelta {
+        turn_id: u64,
+        text: String,
+    },
+    ThinkingDone {
+        turn_id: u64,
+    },
     AssistantDelta {
         turn_id: u64,
         text: String,
@@ -18,6 +25,7 @@ pub enum AgentEvent {
     ToolStarted {
         turn_id: u64,
         tool_name: String,
+        arguments: String,
     },
     ToolOutputDelta {
         turn_id: u64,
@@ -35,6 +43,12 @@ pub enum AgentEvent {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HarnessCommand {
+    Exit,
+    NewSession,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AgentStatus {
     pub model_name: String,
@@ -49,6 +63,7 @@ pub struct Agent<P, T> {
     tools: T,
     context: SessionContext,
     next_turn_id: u64,
+    pending_command: Option<HarnessCommand>,
 }
 
 #[allow(dead_code)]
@@ -59,6 +74,7 @@ impl<P, T> Agent<P, T> {
             tools,
             context,
             next_turn_id: 1,
+            pending_command: None,
         }
     }
 
@@ -87,11 +103,37 @@ where
         }
     }
 
+    pub fn take_pending_command(&mut self) -> Option<HarnessCommand> {
+        self.pending_command.take()
+    }
+
     #[allow(dead_code)]
     pub async fn run_turn<F>(&mut self, input: &str, mut emit: F) -> Result<()>
     where
         F: FnMut(AgentEvent),
     {
+        match parse_slash_command(input) {
+            Ok(Some(HarnessCommand::Exit)) => {
+                self.pending_command = Some(HarnessCommand::Exit);
+                return Ok(());
+            }
+            Ok(Some(HarnessCommand::NewSession)) => {
+                self.context.reset();
+                self.next_turn_id = 1;
+                self.pending_command = Some(HarnessCommand::NewSession);
+                return Ok(());
+            }
+            Err(message) => {
+                emit(AgentEvent::TurnError {
+                    turn_id: 0,
+                    message,
+                });
+                self.context.prune_if_needed();
+                return Ok(());
+            }
+            Ok(None) => {}
+        }
+
         let turn_id = self.next_turn_id;
         self.next_turn_id += 1;
 
@@ -103,6 +145,7 @@ where
             let mut stream = self.provider.stream_chat(request);
             let mut assistant_text = String::new();
             let mut requested_tool = false;
+            let mut thinking_open = false;
 
             while let Some(item) = stream.next().await {
                 let item = match item {
@@ -114,11 +157,22 @@ where
                 };
 
                 match item {
+                    ProviderStreamItem::ThinkingDelta(text) => {
+                        thinking_open = true;
+                        emit(AgentEvent::ThinkingDelta { turn_id, text });
+                    }
                     ProviderStreamItem::AssistantDelta(text) => {
+                        if thinking_open {
+                            emit(AgentEvent::ThinkingDone { turn_id });
+                            thinking_open = false;
+                        }
                         assistant_text.push_str(&text);
                         emit(AgentEvent::AssistantDelta { turn_id, text });
                     }
                     ProviderStreamItem::ToolCall(call) => {
+                        if thinking_open {
+                            emit(AgentEvent::ThinkingDone { turn_id });
+                        }
                         requested_tool = true;
                         if !assistant_text.is_empty() {
                             self.context.push_assistant(&assistant_text);
@@ -130,6 +184,7 @@ where
                         emit(AgentEvent::ToolStarted {
                             turn_id,
                             tool_name: tool_name.clone(),
+                            arguments: call.arguments_json.clone(),
                         });
 
                         match self.tools.execute(&call) {
@@ -164,6 +219,9 @@ where
                         break;
                     }
                     ProviderStreamItem::Done { usage } => {
+                        if thinking_open {
+                            emit(AgentEvent::ThinkingDone { turn_id });
+                        }
                         if assistant_text.is_empty() {
                             drop(stream);
                             return self.finish_turn_error(
@@ -211,6 +269,19 @@ where
     }
 }
 
+fn parse_slash_command(input: &str) -> std::result::Result<Option<HarnessCommand>, String> {
+    let trimmed = input.trim();
+    if !trimmed.starts_with('/') {
+        return Ok(None);
+    }
+
+    match trimmed {
+        "/exit" => Ok(Some(HarnessCommand::Exit)),
+        "/new" => Ok(Some(HarnessCommand::NewSession)),
+        _ => Err(format!("unknown command: {trimmed}")),
+    }
+}
+
 fn tool_output_chunks(body: &str) -> Vec<String> {
     const CHUNK_BYTES: usize = 256;
 
@@ -241,6 +312,7 @@ mod tests {
     use crate::context::SessionContext;
     use crate::llm::{ChatRole, ProviderStreamItem, RequestTokenUsage, ToolCall};
     use crate::test_support::fakes::{FakeProvider, FakeTools};
+    use crate::tui::TuiState;
 
     fn test_agent(provider: FakeProvider, tools: FakeTools) -> Agent<FakeProvider, FakeTools> {
         Agent::new(provider, tools, SessionContext::new(512, None))
@@ -292,6 +364,56 @@ mod tests {
         assert_has_event(&events, |event| {
             matches!(event, AgentEvent::AssistantDone { .. })
         });
+    }
+
+    #[tokio::test]
+    async fn transcript_shows_tool_arguments_inline_instead_of_preview() {
+        let provider = FakeProvider::new(vec![
+            fs_call("list_dir", "src"),
+            ProviderStreamItem::AssistantDelta("done".into()),
+            ProviderStreamItem::Done { usage: None },
+        ]);
+        let tools = FakeTools::with_text("src files", "agent.rs\nmain.rs");
+        let mut agent = test_agent(provider, tools);
+        let mut state = TuiState::default();
+
+        agent
+            .run_turn("show src", |event| state.apply_agent_event(event))
+            .await
+            .unwrap();
+
+        let transcript = state.transcript().text();
+        assert!(
+            transcript
+                .iter()
+                .any(|entry| { entry.contains(r#"Tool fs: {"op":"list_dir","path":"src"}"#) })
+        );
+        assert!(
+            !transcript
+                .iter()
+                .any(|entry| entry.contains("Tool fs: src files"))
+        );
+    }
+
+    #[tokio::test]
+    async fn transcript_renders_provider_thinking_before_assistant_output() {
+        let provider = FakeProvider::new(vec![
+            ProviderStreamItem::ThinkingDelta("line1\nline2\nline3\nline4\nline5".into()),
+            ProviderStreamItem::AssistantDelta("done".into()),
+            ProviderStreamItem::Done { usage: None },
+        ]);
+        let tools = FakeTools::failing("unused");
+        let mut agent = test_agent(provider, tools);
+        let mut state = TuiState::default();
+
+        agent
+            .run_turn("think", |event| state.apply_agent_event(event))
+            .await
+            .unwrap();
+
+        let transcript = state.transcript().text();
+        assert!(transcript[0].contains("Thinking: line1"));
+        assert!(transcript[1].contains("Assistant: done"));
     }
 
     #[tokio::test]
@@ -406,6 +528,71 @@ mod tests {
             !events
                 .iter()
                 .any(|event| matches!(event, AgentEvent::AssistantDone { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn exit_command_skips_provider_requests() {
+        let provider = FakeProvider::new(vec![
+            ProviderStreamItem::AssistantDelta("should not run".into()),
+            ProviderStreamItem::Done { usage: None },
+        ]);
+        let tools = FakeTools::with_text("unused", "unused");
+        let mut agent = test_agent(provider, tools);
+        let mut events = Vec::new();
+
+        agent
+            .run_turn("/exit", |event| events.push(event))
+            .await
+            .unwrap();
+
+        assert!(events.is_empty());
+        assert!(agent.provider().requests().is_empty());
+        assert!(agent.context().chat_request().unwrap().messages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn new_command_clears_existing_context_without_provider_requests() {
+        let provider = FakeProvider::new(vec![
+            ProviderStreamItem::AssistantDelta("should not run".into()),
+            ProviderStreamItem::Done { usage: None },
+        ]);
+        let tools = FakeTools::with_text("unused", "unused");
+        let mut context = SessionContext::new(512, Some("Follow repo conventions.".into()));
+        context.push_user("old question");
+        context.push_assistant("old answer");
+        context.push_tool_output("fs", "src/main.rs");
+        let mut agent = Agent::new(provider, tools, context);
+
+        agent.run_turn("/new", |_| {}).await.unwrap();
+
+        assert!(agent.provider().requests().is_empty());
+        let request = agent.context().chat_request().unwrap();
+        assert_eq!(request.messages.len(), 1);
+        assert_eq!(request.messages[0].role, ChatRole::System);
+        assert_eq!(request.messages[0].content, "Follow repo conventions.");
+    }
+
+    #[tokio::test]
+    async fn unknown_slash_command_emits_local_error_without_provider_requests() {
+        let provider = FakeProvider::new(vec![
+            ProviderStreamItem::AssistantDelta("should not run".into()),
+            ProviderStreamItem::Done { usage: None },
+        ]);
+        let tools = FakeTools::with_text("unused", "unused");
+        let mut agent = test_agent(provider, tools);
+        let mut events = Vec::new();
+
+        agent
+            .run_turn("/wat", |event| events.push(event))
+            .await
+            .unwrap();
+
+        assert!(agent.provider().requests().is_empty());
+        assert_eq!(agent.context().chat_request().unwrap().messages.len(), 0);
+        assert_has_event(
+            &events,
+            |event| matches!(event, AgentEvent::TurnError { message, .. } if message.contains("unknown command")),
         );
     }
 

@@ -27,13 +27,13 @@ When behavior is not specified in this file, ask a clarifying question rather th
 - Persistent session history
 - Multiple LLM providers
 - Dedicated search tooling
-- Additional config beyond the llama.cpp server address
+- Additional config beyond the server URL, context pruning limit, and optional system prompt file
 - Test requirements beyond unit tests
 
 ## Crate layout (v1)
 
 ```text
-coding_agent/
+src/
 ├── main.rs              # Startup, config loading, startup-directory resolution, TUI bootstrap
 ├── agent.rs             # Core loop: plan -> act -> observe -> repeat
 ├── tools/
@@ -55,21 +55,24 @@ coding_agent/
 
 Remove the dedicated search tool from v1. Directory inspection should happen through `fs`.
 
-If the current crate still contains `tools/search.rs`, remove it from the v1 path.  
-If the current crate still contains `llm/openai.rs`, rename or replace it so the crate reflects the actual llama.cpp-only v1 scope.
+The active provider implementation lives in `llm/llama_cpp.rs`. The config surface still uses `ollama_url` naming because v1 talks to llama.cpp through an Ollama-compatible HTTP API shape.
 
 ## Runtime model
 
 1. Start from the current working directory. The startup directory is the tool root even when it is a subdirectory of a Git repo or not a Git repo at all.
-2. Load the v1 config values: the llama.cpp server address, the context pruning limit, and the optional system prompt file.
+2. Load the v1 config values: the llama.cpp server base URL, the context pruning limit, and the optional system prompt file.
 3. Start one in-memory chat session.
 4. Accept user input in the TUI.
-5. Send session context to the llama.cpp backend.
+5. Send session context to the llama.cpp backend through its Ollama-compatible chat API.
 6. Stream assistant output to the TUI.
 7. When the assistant requests a tool, execute it automatically.
 8. Stream tool status and tool output to the TUI.
 9. Feed tool observations back into the loop.
 10. End the session when the user quits. Do not persist history between runs.
+
+The TUI must also support local slash commands:
+- `/exit` closes the harness immediately
+- `/new` clears the visible transcript and starts a fresh in-memory agent context
 
 ## Architecture rules
 
@@ -97,7 +100,7 @@ If the current crate still contains `llm/openai.rs`, rename or replace it so the
 - Detect and execute tool requests automatically.
 - Stream assistant and tool events to the TUI.
 - Stop cleanly on user exit or fatal error.
-- Keep internal planning text internal; only assistant output and tool events stream to the TUI.
+- Keep internal planning text internal. Only assistant output, tool events, and provider-exposed thinking may stream to the TUI.
 
 ### `tui/`
 
@@ -119,8 +122,8 @@ If the current crate still contains `llm/openai.rs`, rename or replace it so the
 
 - Perform file operations inside the startup directory only.
 - Normalize and validate all paths before touching the filesystem.
-- v1 filesystem access is read-only.
-- Allowed operations are reading file contents, listing directories, and reading file metadata. Writes, deletes, renames, and directory creation are out of scope for v1.
+- v1 filesystem access supports structured UTF-8 text reads and writes.
+- Allowed operations are `read_file`, `list_dir`, `write_file`, and `edit_file`. Filesystem metadata may be used internally to validate paths or infer which of the read operations to run when `op` is omitted, but there is no separate metadata-reading tool operation in v1. `write_file` may create missing parent directories inside the startup directory. Deletes and renames remain out of scope for v1.
 
 ### `llm/mod.rs`
 
@@ -136,8 +139,9 @@ If the current crate still contains `llm/openai.rs`, rename or replace it so the
 
 - Implement the v1 provider.
 - Use only the configured llama.cpp server address.
+- The implementation speaks to llama.cpp using an Ollama-compatible HTTP surface. That compatibility is why config names still use `ollama_url` even though v1 supports llama.cpp only.
 - Discover the first available model from the configured llama.cpp server at startup and fail fast with a clear startup error if the server advertises no models.
-- Use the server's `/api/chat` endpoint with streaming enabled and its tool-calling shape for tool requests.
+- Use the server's Ollama-compatible `/api/tags` discovery endpoint at startup and `/api/chat` with streaming enabled and its tool-calling shape for tool requests.
 
 ### `context.rs`
 
@@ -154,11 +158,12 @@ If the current crate still contains `llm/openai.rs`, rename or replace it so the
   - CLI flags
   - environment variables
   - `~/.config/glass/config.toml`
-- The v1 config values are the llama.cpp server address, the context pruning limit, and an optional system prompt file.
+- The v1 config values are the llama.cpp server base URL, the context pruning limit, and an optional system prompt file.
 - Validate config at startup and fail fast with a clear error.
 - Use the CLI flag name `--ollama-url`.
 - Use the environment variable name `GLASS_OLLAMA_URL`.
 - Use the TOML key `ollama_url`.
+- These names are retained for compatibility with the Ollama-style HTTP API exposed by the llama.cpp server used in v1.
 - Use the CLI flag name `--context-limit-tokens`.
 - Use the environment variable name `GLASS_CONTEXT_LIMIT_TOKENS`.
 - Use the TOML key `context_limit_tokens`.
@@ -182,10 +187,12 @@ If the current crate still contains `llm/openai.rs`, rename or replace it so the
 - The TUI is the only frontend in v1.
 - Assistant output must stream live.
 - Tool activity and tool output must stream live.
+- Provider-exposed thinking may stream live when the backend emits it, but Glass internal planning must remain hidden.
 - Keep TUI code isolated so headless mode can be added later without rewriting the agent loop.
-- Use a single scrolling transcript pane with a bottom input composer; show tool activity and tool output inline in the transcript.
+- Use a single scrolling transcript pane with a bottom input composer; show tool activity, tool output, and provider-exposed thinking inline in the transcript.
 - Use `Enter` to send, `Ctrl+J` to insert a newline, `Shift+Enter` as an additional newline shortcut when the terminal reports it, `PageUp`/`PageDown` to scroll the transcript, mouse-wheel scrolling over the transcript for small scroll steps, and `Ctrl+C` to quit.
-- Fold long tool output inline behind a short preview and allow it to be expanded and collapsed in place on mouse click; do not add a separate pager in v1.
+- Treat slash-prefixed local commands as TUI-accessible harness controls: `/exit` quits immediately and `/new` starts a fresh in-memory session while preserving configured system settings.
+- Fold long tool output and completed provider-thinking blocks inline behind a short preview and allow them to be expanded and collapsed in place on mouse click; do not add a separate pager in v1.
 
 ## Testing
 

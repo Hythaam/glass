@@ -1,8 +1,8 @@
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::fmt::Display;
 use std::ffi::OsString;
+use std::fmt::Display;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
@@ -59,10 +59,48 @@ impl FsTool {
         ))
     }
 
+    fn write_file(&self, input: &str, contents: &str) -> Result<ToolResult> {
+        let path = self.resolve(input)?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| anyhow!("{}", self.must_stay_inside_root(input)))?;
+        fs::create_dir_all(parent).with_context(|| {
+            self.inside_startup_dir(format!("failed to create parent directories for '{input}'"))
+        })?;
+        fs::write(&path, contents)
+            .with_context(|| self.inside_startup_dir(format!("failed to write file '{input}'")))?;
+        Ok(ToolResult::text(
+            format!("wrote {input}"),
+            format!("wrote {input}"),
+        ))
+    }
+
+    fn edit_file(&self, input: &str, edits: &[FsTextEdit]) -> Result<ToolResult> {
+        let path = self.resolve(input)?;
+        let bytes = fs::read(&path)
+            .with_context(|| self.inside_startup_dir(format!("failed to read file '{input}'")))?;
+        let mut body = String::from_utf8(bytes).map_err(|_| {
+            anyhow!(
+                "file '{input}' contains invalid UTF-8; this tool only supports reading text files"
+            )
+        })?;
+
+        for (index, edit) in edits.iter().enumerate() {
+            body = self.apply_text_edit(input, index, &body, edit)?;
+        }
+
+        fs::write(&path, &body)
+            .with_context(|| self.inside_startup_dir(format!("failed to write file '{input}'")))?;
+        Ok(ToolResult::text(
+            format!("edited {input}"),
+            format!("edited {input}"),
+        ))
+    }
+
     // Note: This two-pass approach (resolving an existing prefix and then canonicalizing the final path)
     // reduces symlink-escape attacks but cannot eliminate a TOCTOU race — the filesystem may change
-    // between checks. For a read-only tool that's scoped to a startup directory, this risk is acceptable
-    // because we never write and we additionally verify the canonicalized final path stays inside root.
+    // between checks. For a tool that's scoped to a startup directory, this risk is acceptable because
+    // we additionally verify the canonicalized final path stays inside root before filesystem access.
     // Important: the second canonicalize() call after confirming the candidate exists is intentional and
     // must not be removed. It ensures any symlinks on the final path are resolved and produces a canonical
     // absolute target that we re-check against self.root. Without this final canonicalize, a symlink could be
@@ -189,13 +227,69 @@ impl FsTool {
             self.startup_dir_label()
         )
     }
+
+    fn apply_text_edit(
+        &self,
+        input: &str,
+        index: usize,
+        current: &str,
+        edit: &FsTextEdit,
+    ) -> Result<String> {
+        if edit.old_text.is_empty() {
+            return Err(anyhow!(
+                "edit {} for file '{input}' has empty old_text",
+                index + 1
+            ));
+        }
+
+        let matches = current.match_indices(&edit.old_text).collect::<Vec<_>>();
+        match matches.len() {
+            0 => Err(anyhow!(
+                "edit {} for file '{input}' did not match any text",
+                index + 1
+            )),
+            1 => {
+                let start = matches[0].0;
+                let end = start + edit.old_text.len();
+                let mut updated = String::with_capacity(
+                    current.len() - edit.old_text.len() + edit.new_text.len(),
+                );
+                updated.push_str(&current[..start]);
+                updated.push_str(&edit.new_text);
+                updated.push_str(&current[end..]);
+                Ok(updated)
+            }
+            _ => Err(anyhow!(
+                "edit {} for file '{input}' matched multiple locations",
+                index + 1
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 enum FsToolArguments {
-    ReadFile { path: String },
-    ListDir { path: String },
+    ReadFile {
+        path: String,
+    },
+    ListDir {
+        path: String,
+    },
+    WriteFile {
+        path: String,
+        contents: String,
+    },
+    EditFile {
+        path: String,
+        edits: Vec<FsTextEdit>,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+struct FsTextEdit {
+    old_text: String,
+    new_text: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -217,18 +311,34 @@ impl ToolExecutor for FsTool {
             r#type: "function".into(),
             function: ToolFunction {
                 name: "fs".into(),
-                description: "Read files and directories inside the startup directory".into(),
+                description: "Read and write UTF-8 text files inside the startup directory".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
                         "op": {
                             "type": "string",
-                            "enum": ["read_file", "list_dir"],
-                            "description": "Operation to run. Use read_file for UTF-8 text files and list_dir for directories."
+                            "enum": ["read_file", "list_dir", "write_file", "edit_file"],
+                            "description": "Operation to run. Use read_file for UTF-8 text files, list_dir for directories, write_file for overwrite/create, and edit_file for targeted edits."
                         },
                         "path": {
                             "type": "string",
                             "description": "Relative path inside the startup directory"
+                        },
+                        "contents": {
+                            "type": "string",
+                            "description": "UTF-8 text to write when op is write_file"
+                        },
+                        "edits": {
+                            "type": "array",
+                            "description": "Ordered text replacements to apply when op is edit_file",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "old_text": { "type": "string" },
+                                    "new_text": { "type": "string" }
+                                },
+                                "required": ["old_text", "new_text"]
+                            }
                         }
                     },
                     "required": ["op", "path"]
@@ -249,6 +359,8 @@ impl ToolExecutor for FsTool {
         match arguments {
             FsToolArguments::ReadFile { path } => self.read_file(&path),
             FsToolArguments::ListDir { path } => self.list_dir(&path),
+            FsToolArguments::WriteFile { path, contents } => self.write_file(&path, &contents),
+            FsToolArguments::EditFile { path, edits } => self.edit_file(&path, &edits),
         }
     }
 }
@@ -496,6 +608,131 @@ mod tests {
             .to_string();
 
         assert!(error.contains("invalid arguments for tool 'fs'"));
+    }
+
+    #[test]
+    fn execute_write_file_creates_missing_parent_dirs() {
+        let root = TestDir::new("fs-write-create");
+
+        let mut tool = tool_for(&root);
+        let result = tool
+            .execute(&ToolCall {
+                name: "fs".into(),
+                arguments_json: r#"{"op":"write_file","path":"nested/new.txt","contents":"hello"}"#
+                    .into(),
+            })
+            .unwrap();
+
+        assert!(text_body(&result).contains("nested/new.txt"));
+        assert_eq!(
+            fs::read_to_string(root.child("nested/new.txt")).unwrap(),
+            "hello"
+        );
+    }
+
+    #[test]
+    fn execute_edit_file_replaces_exact_match() {
+        let root = TestDir::new("fs-edit");
+        root.write_text("note.txt", "alpha\nbeta\ngamma\n");
+
+        let mut tool = tool_for(&root);
+        let result = tool
+            .execute(&ToolCall {
+                name: "fs".into(),
+                arguments_json: r#"{"op":"edit_file","path":"note.txt","edits":[{"old_text":"beta","new_text":"BETA"}]}"#.into(),
+            })
+            .unwrap();
+
+        assert!(text_body(&result).contains("note.txt"));
+        assert_eq!(
+            fs::read_to_string(root.child("note.txt")).unwrap(),
+            "alpha\nBETA\ngamma\n"
+        );
+    }
+
+    #[test]
+    fn definitions_advertise_write_and_edit_file_ops() {
+        let root = TestDir::new("fs-definitions");
+        let tool = tool_for(&root);
+        let definitions = tool.definitions();
+        let parameters = &definitions[0].function.parameters;
+        let ops = parameters["properties"]["op"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|value| value.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(ops.contains(&"write_file"));
+        assert!(ops.contains(&"edit_file"));
+    }
+
+    #[test]
+    fn edit_file_rejects_zero_match() {
+        let root = TestDir::new("fs-edit-no-match");
+        root.write_text("note.txt", "alpha\nbeta\ngamma\n");
+
+        let mut tool = tool_for(&root);
+        let error = tool
+            .execute(&ToolCall {
+                name: "fs".into(),
+                arguments_json: r#"{"op":"edit_file","path":"note.txt","edits":[{"old_text":"delta","new_text":"DELTA"}]}"#.into(),
+            })
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("did not match any text"));
+    }
+
+    #[test]
+    fn edit_file_rejects_multiple_matches() {
+        let root = TestDir::new("fs-edit-multi-match");
+        root.write_text("note.txt", "beta\nbeta\n");
+
+        let mut tool = tool_for(&root);
+        let error = tool
+            .execute(&ToolCall {
+                name: "fs".into(),
+                arguments_json: r#"{"op":"edit_file","path":"note.txt","edits":[{"old_text":"beta","new_text":"BETA"}]}"#.into(),
+            })
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("matched multiple locations"));
+    }
+
+    #[test]
+    fn edit_file_rejects_invalid_utf8() {
+        let root = TestDir::new("fs-edit-invalid-utf8");
+        root.write_bytes("binary.dat", &[0xff, 0xfe, 0xfd]);
+
+        let mut tool = tool_for(&root);
+        let error = tool
+            .execute(&ToolCall {
+                name: "fs".into(),
+                arguments_json: r#"{"op":"edit_file","path":"binary.dat","edits":[{"old_text":"a","new_text":"b"}]}"#.into(),
+            })
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("contains invalid UTF-8"));
+    }
+
+    #[test]
+    fn write_file_rejects_paths_outside_root() {
+        let root = TestDir::new("fs-write-outside");
+
+        let mut tool = tool_for(&root);
+        let error = tool
+            .execute(&ToolCall {
+                name: "fs".into(),
+                arguments_json:
+                    r#"{"op":"write_file","path":"../../escape.txt","contents":"hello"}"#.into(),
+            })
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("startup directory"));
     }
 
     fn text_body(result: &ToolResult) -> &str {

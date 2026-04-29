@@ -37,7 +37,8 @@ impl CliConfig {
         while let Some(raw_arg) = args.next() {
             let arg = os_string_to_string(raw_arg, "CLI arguments")?;
             if arg == OLLAMA_URL_FLAG {
-                config.set_flag_value(OLLAMA_URL_FLAG, next_arg_value(&mut args, OLLAMA_URL_FLAG)?)?;
+                config
+                    .set_flag_value(OLLAMA_URL_FLAG, next_arg_value(&mut args, OLLAMA_URL_FLAG)?)?;
             } else if arg == CONTEXT_LIMIT_TOKENS_FLAG {
                 config.set_flag_value(
                     CONTEXT_LIMIT_TOKENS_FLAG,
@@ -170,7 +171,9 @@ impl Config {
             .ollama_url
             .or(env.ollama_url)
             .or(file.ollama_url)
-            .ok_or_else(|| missing_required_setting("ollama_url", OLLAMA_URL_FLAG, OLLAMA_URL_ENV))?;
+            .ok_or_else(|| {
+                missing_required_setting("ollama_url", OLLAMA_URL_FLAG, OLLAMA_URL_ENV)
+            })?;
         let context_limit_tokens = cli
             .context_limit_tokens
             .or(env.context_limit_tokens)

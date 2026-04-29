@@ -17,12 +17,12 @@ use ratatui::layout::Rect;
 use ratatui::widgets::Paragraph;
 use tokio::sync::{Mutex, mpsc};
 
-use crate::agent::{Agent, AgentEvent, AgentStatus};
+use crate::agent::{Agent, AgentEvent, AgentStatus, HarnessCommand};
 use crate::llm::Provider;
 use crate::tools::ToolExecutor;
 
 use super::render::{
-    composer_block, composer_cursor_position, composer_inner_area, layout_chunks,
+    composer_cursor_position, composer_inner_area, composer_paragraph, layout_chunks,
     transcript_inner_size,
 };
 use super::state::{TuiAction, TuiState};
@@ -34,6 +34,7 @@ enum AppEvent {
     Agent(AgentEvent),
     AgentFailed(String),
     Status(AgentStatus),
+    Command(HarnessCommand),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -50,6 +51,7 @@ pub struct TuiApp<P, T> {
     startup_dir: PathBuf,
     state: TuiState,
     transcript_area: Rect,
+    should_exit: bool,
 }
 
 impl<P, T> TuiApp<P, T>
@@ -65,6 +67,7 @@ where
             startup_dir,
             state,
             transcript_area: Rect::default(),
+            should_exit: false,
         }
     }
 
@@ -82,6 +85,10 @@ where
         loop {
             while let Ok(app_event) = rx.try_recv() {
                 self.handle_app_event(app_event);
+            }
+
+            if self.should_exit {
+                return Ok(());
             }
 
             self.draw(&mut terminal)?;
@@ -110,7 +117,7 @@ where
     fn spawn_turn(&self, input: String, tx: mpsc::UnboundedSender<AppEvent>) {
         let agent = Arc::clone(&self.agent);
         tokio::spawn(async move {
-            let (result, status) = {
+            let (result, status, command) = {
                 let mut agent = agent.lock().await;
                 let result = agent
                     .run_turn(&input, |event| {
@@ -118,10 +125,14 @@ where
                     })
                     .await;
                 let status = agent.status_snapshot();
-                (result, status)
+                let command = agent.take_pending_command();
+                (result, status, command)
             };
 
             let _ = tx.send(AppEvent::Status(status));
+            if let Some(command) = command {
+                let _ = tx.send(AppEvent::Command(command));
+            }
             if let Err(error) = result {
                 let _ = tx.send(AppEvent::AgentFailed(error.to_string()));
             }
@@ -152,6 +163,8 @@ where
                 });
             }
             AppEvent::Status(status) => self.state.update_status(status),
+            AppEvent::Command(HarnessCommand::Exit) => self.should_exit = true,
+            AppEvent::Command(HarnessCommand::NewSession) => self.state.reset_session(),
         }
     }
 
@@ -211,10 +224,11 @@ where
         let transcript =
             Paragraph::new(self.state.render_transcript(layout.transcript_inner_width))
                 .scroll((self.state.transcript_scroll(), 0));
-        let composer = Paragraph::new(self.state.composer()).block(composer_block(
+        let composer = composer_paragraph(
+            self.state.composer().to_string(),
             &self.startup_dir,
             self.state.is_turn_in_flight(),
-        ));
+        );
         let status = Paragraph::new(
             self.state
                 .status_line_span(layout.status_area.width as usize),
@@ -242,6 +256,16 @@ where
     #[cfg(test)]
     pub(crate) fn set_transcript_area(&mut self, area: Rect) {
         self.transcript_area = area;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn apply_harness_command_for_test(&mut self, command: HarnessCommand) {
+        self.handle_app_event(AppEvent::Command(command));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn should_exit_for_test(&self) -> bool {
+        self.should_exit
     }
 }
 

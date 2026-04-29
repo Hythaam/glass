@@ -7,7 +7,8 @@ pub use app::TuiApp;
 
 #[cfg(test)]
 pub(crate) use render::{
-    composer_block, composer_cursor_position, layout_chunks, transcript_inner_size,
+    composer_block, composer_cursor_position, composer_paragraph, layout_chunks,
+    transcript_inner_size,
 };
 #[cfg(test)]
 pub(crate) use state::{TuiAction, TuiState};

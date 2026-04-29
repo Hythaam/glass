@@ -143,6 +143,8 @@ struct ChunkMessage {
     #[serde(default)]
     content: Option<String>,
     #[serde(default)]
+    thinking: Option<String>,
+    #[serde(default)]
     tool_calls: Option<Vec<ChunkToolCall>>,
 }
 
@@ -194,6 +196,8 @@ struct OpenAiTimings {
 struct OpenAiDelta {
     #[serde(default)]
     content: Option<String>,
+    #[serde(default)]
+    thinking: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<OpenAiToolCallDelta>>,
 }
@@ -340,6 +344,14 @@ fn parse_openai_chat_chunk(
     }
 
     for choice in chunk.choices {
+        if let Some(thinking) = choice
+            .delta
+            .thinking
+            .filter(|thinking| !thinking.is_empty())
+        {
+            return Ok(Some(ProviderStreamItem::ThinkingDelta(thinking)));
+        }
+
         if let Some(tool_calls) = choice.delta.tool_calls {
             for tool_call in tool_calls {
                 ensure_single_tool_call_index(tool_call.index)?;
@@ -396,6 +408,10 @@ fn parse_ollama_chat_chunk(chunk: ChatChunk) -> ProviderResult<Option<ProviderSt
         )));
     }
 
+    if let Some(thinking) = message.thinking.filter(|thinking| !thinking.is_empty()) {
+        return Ok(Some(ProviderStreamItem::ThinkingDelta(thinking)));
+    }
+
     Ok(message
         .content
         .filter(|content| !content.is_empty())
@@ -407,6 +423,13 @@ fn parse_stateless_openai_chat_chunk(
     chunk: OpenAiChatChunk,
 ) -> ProviderResult<Option<ProviderStreamItem>> {
     for choice in chunk.choices {
+        if let Some(thinking) = choice
+            .delta
+            .thinking
+            .filter(|thinking| !thinking.is_empty())
+        {
+            return Ok(Some(ProviderStreamItem::ThinkingDelta(thinking)));
+        }
         if let Some(content) = choice.delta.content.filter(|content| !content.is_empty()) {
             return Ok(Some(ProviderStreamItem::AssistantDelta(content)));
         }
@@ -658,6 +681,13 @@ mod tests {
     fn parses_done_chunk() {
         let item = parse_chat_chunk(&ollama_done_chunk()).unwrap();
         assert_eq!(item, Some(ProviderStreamItem::Done { usage: None }));
+    }
+
+    #[test]
+    fn parses_ollama_thinking_chunk() {
+        let item = parse_chat_chunk(&ollama_thinking_chunk("pondering")).unwrap();
+
+        assert_eq!(format!("{item:?}"), r#"Some(ThinkingDelta("pondering"))"#);
     }
 
     #[tokio::test]
@@ -1027,6 +1057,10 @@ mod tests {
 
     fn ollama_done_chunk() -> String {
         json!({"done": true}).to_string()
+    }
+
+    fn ollama_thinking_chunk(thinking: &str) -> String {
+        json!({"message":{"thinking":thinking},"done":false}).to_string()
     }
 
     fn openai_content_chunk(content: &str) -> String {

@@ -5,7 +5,9 @@ use ratatui::text::{Span, Text};
 
 use crate::agent::{AgentEvent, AgentStatus};
 
-use super::render::{compose_status_line, rect_contains, transcript_inner_size, wrap_plain_text};
+use super::render::{
+    compose_status_line, rect_contains, transcript_inner_size, wrap_composer_text,
+};
 use super::transcript::{ToolOutputDirection, TranscriptState};
 
 const PAGE_SCROLL_LINES: u16 = 10;
@@ -54,6 +56,12 @@ impl TuiState {
         self.status = status;
     }
 
+    pub(crate) fn reset_session(&mut self) {
+        self.transcript = TranscriptState::default();
+        self.composer.clear();
+        self.turn_in_flight = false;
+    }
+
     pub(crate) fn status_line(&self, width: usize) -> String {
         if width == 0 {
             return String::new();
@@ -86,7 +94,9 @@ impl TuiState {
     }
 
     pub(crate) fn composer_visual_lines(&self, width: usize) -> usize {
-        wrap_plain_text(self.composer(), width.max(1)).len().max(1)
+        wrap_composer_text(self.composer(), width.max(1))
+            .len()
+            .max(1)
     }
 
     pub(crate) fn composer_height(&self, width: usize) -> u16 {
@@ -136,6 +146,8 @@ impl TuiState {
                 self.turn_in_flight = true;
             }
             AgentEvent::AssistantDelta { .. }
+            | AgentEvent::ThinkingDelta { .. }
+            | AgentEvent::ThinkingDone { .. }
             | AgentEvent::ToolOutputDelta { .. }
             | AgentEvent::ToolFinished { .. } => {}
         }
@@ -208,7 +220,8 @@ impl TuiState {
     }
 
     fn submit_composer(&mut self) -> TuiAction {
-        if self.turn_in_flight || self.composer.trim().is_empty() {
+        let trimmed = self.composer.trim();
+        if trimmed.is_empty() || (self.turn_in_flight && trimmed != "/exit") {
             return TuiAction::None;
         }
 

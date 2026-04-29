@@ -14,6 +14,12 @@ pub(crate) enum ToolOutputDirection {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum TranscriptEntry {
     User(String),
+    Thinking {
+        turn_id: u64,
+        text: String,
+        done: bool,
+        folded: bool,
+    },
     Assistant {
         turn_id: u64,
         text: String,
@@ -22,11 +28,12 @@ enum TranscriptEntry {
     ToolStatus {
         turn_id: u64,
         tool_name: String,
+        arguments: String,
     },
     ToolOutput {
         turn_id: u64,
         tool_name: String,
-        preview: String,
+        arguments: String,
         body: String,
         folded: bool,
     },
@@ -55,17 +62,64 @@ impl TranscriptEntry {
                         .add_modifier(Modifier::BOLD),
                 ),
             )],
+            Self::Thinking {
+                text, done, folded, ..
+            } => {
+                let preview = text.lines().next().unwrap_or_default();
+                if *done && *folded {
+                    vec![
+                        (
+                            format!("Thinking: {preview}"),
+                            with_selection(Style::default().fg(Color::Magenta)),
+                        ),
+                        (
+                            "(Enter or click to expand)".into(),
+                            with_selection(Style::default().fg(Color::DarkGray)),
+                        ),
+                    ]
+                } else if *done {
+                    vec![
+                        (
+                            "Thinking".into(),
+                            with_selection(Style::default().fg(Color::Magenta)),
+                        ),
+                        (
+                            text.clone(),
+                            with_selection(Style::default().fg(Color::DarkGray)),
+                        ),
+                        (
+                            "(Enter or click to collapse)".into(),
+                            with_selection(Style::default().fg(Color::DarkGray)),
+                        ),
+                    ]
+                } else {
+                    vec![
+                        (
+                            "Thinking...".into(),
+                            with_selection(Style::default().fg(Color::Magenta)),
+                        ),
+                        (
+                            text.clone(),
+                            with_selection(Style::default().fg(Color::DarkGray)),
+                        ),
+                    ]
+                }
+            }
             Self::Assistant { text, .. } => vec![(
                 format!("Assistant: {text}"),
                 with_selection(Style::default().fg(Color::Green)),
             )],
-            Self::ToolStatus { tool_name, .. } => vec![(
-                format!("Tool {tool_name}: running…"),
+            Self::ToolStatus {
+                tool_name,
+                arguments,
+                ..
+            } => vec![(
+                format!("Tool {tool_name}: {arguments} - running..."),
                 with_selection(Style::default().fg(Color::Yellow)),
             )],
             Self::ToolOutput {
                 tool_name,
-                preview,
+                arguments,
                 body,
                 folded,
                 ..
@@ -73,7 +127,7 @@ impl TranscriptEntry {
                 if *folded {
                     vec![
                         (
-                            format!("Tool {tool_name}: {preview}"),
+                            format!("Tool {tool_name}: {arguments}"),
                             with_selection(Style::default().fg(Color::Yellow)),
                         ),
                         (
@@ -84,7 +138,7 @@ impl TranscriptEntry {
                 } else {
                     vec![
                         (
-                            format!("Tool {tool_name}: {preview}"),
+                            format!("Tool {tool_name}: {arguments}"),
                             with_selection(Style::default().fg(Color::Yellow)),
                         ),
                         (
@@ -141,11 +195,19 @@ pub(crate) struct TranscriptState {
 impl TranscriptState {
     pub(crate) fn apply_agent_event(&mut self, event: AgentEvent) {
         match event {
+            AgentEvent::ThinkingDelta { turn_id, text } => {
+                self.append_thinking_delta(turn_id, text)
+            }
+            AgentEvent::ThinkingDone { turn_id } => self.finish_thinking(turn_id),
             AgentEvent::AssistantDelta { turn_id, text } => {
                 self.append_assistant_delta(turn_id, text)
             }
             AgentEvent::AssistantDone { turn_id } => self.finish_assistant_turn(turn_id),
-            AgentEvent::ToolStarted { turn_id, tool_name } => self.start_tool(turn_id, tool_name),
+            AgentEvent::ToolStarted {
+                turn_id,
+                tool_name,
+                arguments,
+            } => self.start_tool(turn_id, tool_name, arguments),
             AgentEvent::ToolOutputDelta {
                 turn_id,
                 tool_name,
@@ -309,6 +371,42 @@ impl TranscriptState {
         });
     }
 
+    fn append_thinking_delta(&mut self, turn_id: u64, text: String) {
+        if let Some(TranscriptEntry::Thinking {
+            turn_id: active_turn_id,
+            text: active_text,
+            done,
+            ..
+        }) = self.entries.last_mut()
+            && *active_turn_id == turn_id
+            && !*done
+        {
+            active_text.push_str(&text);
+            return;
+        }
+
+        self.entries.push(TranscriptEntry::Thinking {
+            turn_id,
+            text,
+            done: false,
+            folded: false,
+        });
+    }
+
+    fn finish_thinking(&mut self, turn_id: u64) {
+        if let Some(TranscriptEntry::Thinking {
+            turn_id: active_turn_id,
+            text,
+            done,
+            folded,
+        }) = self.entries.last_mut()
+            && *active_turn_id == turn_id
+        {
+            *done = true;
+            *folded = should_fold_tool_output(text);
+        }
+    }
+
     fn finish_assistant_turn(&mut self, turn_id: u64) {
         if let Some(TranscriptEntry::Assistant {
             turn_id: active_turn_id,
@@ -321,9 +419,12 @@ impl TranscriptState {
         }
     }
 
-    pub(crate) fn start_tool(&mut self, turn_id: u64, tool_name: String) {
-        self.entries
-            .push(TranscriptEntry::ToolStatus { turn_id, tool_name });
+    pub(crate) fn start_tool(&mut self, turn_id: u64, tool_name: String, arguments: String) {
+        self.entries.push(TranscriptEntry::ToolStatus {
+            turn_id,
+            tool_name,
+            arguments,
+        });
     }
 
     pub(crate) fn append_tool_output(&mut self, turn_id: u64, tool_name: String, text: String) {
@@ -341,11 +442,12 @@ impl TranscriptState {
                 TranscriptEntry::ToolStatus {
                     turn_id: active_turn_id,
                     tool_name: active_tool_name,
+                    arguments,
                 } if *active_turn_id == turn_id && *active_tool_name == tool_name => {
                     *last_entry = Self::tool_output_entry(
                         turn_id,
                         tool_name.clone(),
-                        format!("{tool_name} output"),
+                        arguments.clone(),
                         text,
                     );
                     return;
@@ -357,31 +459,35 @@ impl TranscriptState {
         self.entries.push(Self::tool_output_entry(
             turn_id,
             tool_name.clone(),
-            format!("{tool_name} output"),
+            String::new(),
             text,
         ));
     }
 
-    pub(crate) fn finish_tool_output(&mut self, turn_id: u64, tool_name: String, preview: String) {
+    pub(crate) fn finish_tool_output(&mut self, turn_id: u64, tool_name: String, _preview: String) {
         if let Some(last_entry) = self.entries.last_mut() {
             match last_entry {
                 TranscriptEntry::ToolOutput {
                     turn_id: active_turn_id,
                     tool_name: active_tool_name,
-                    preview: active_preview,
                     body,
                     folded,
+                    ..
                 } if *active_turn_id == turn_id && *active_tool_name == tool_name => {
-                    *active_preview = preview;
                     *folded = should_fold_tool_output(body);
                     return;
                 }
                 TranscriptEntry::ToolStatus {
                     turn_id: active_turn_id,
                     tool_name: active_tool_name,
+                    arguments,
                 } if *active_turn_id == turn_id && *active_tool_name == tool_name => {
-                    *last_entry =
-                        Self::tool_output_entry(turn_id, tool_name, preview, String::new());
+                    *last_entry = Self::tool_output_entry(
+                        turn_id,
+                        tool_name,
+                        arguments.clone(),
+                        String::new(),
+                    );
                     return;
                 }
                 _ => {}
@@ -391,7 +497,7 @@ impl TranscriptState {
         self.entries.push(Self::tool_output_entry(
             turn_id,
             tool_name,
-            preview,
+            String::new(),
             String::new(),
         ));
     }
@@ -404,13 +510,13 @@ impl TranscriptState {
     fn tool_output_entry(
         turn_id: u64,
         tool_name: String,
-        preview: String,
+        arguments: String,
         body: String,
     ) -> TranscriptEntry {
         TranscriptEntry::ToolOutput {
             turn_id,
             tool_name,
-            preview,
+            arguments,
             body,
             folded: false,
         }
@@ -426,16 +532,18 @@ impl TranscriptState {
             (Some(current), ToolOutputDirection::Down) => {
                 self.next_tool_output_index_after(current).or(Some(current))
             }
-            (Some(current), ToolOutputDirection::Up) => {
-                self.previous_tool_output_index_before(current)
-                    .or(Some(current))
-            }
+            (Some(current), ToolOutputDirection::Up) => self
+                .previous_tool_output_index_before(current)
+                .or(Some(current)),
         }
     }
 
     fn toggle_tool_output(&mut self, index: usize) -> bool {
         match self.entries.get_mut(index) {
-            Some(TranscriptEntry::ToolOutput { folded, .. }) => {
+            Some(TranscriptEntry::ToolOutput { folded, .. })
+            | Some(TranscriptEntry::Thinking {
+                folded, done: true, ..
+            }) => {
                 *folded = !*folded;
                 true
             }
@@ -449,7 +557,8 @@ impl TranscriptState {
             .enumerate()
             .rev()
             .find_map(|(index, entry)| match entry {
-                TranscriptEntry::ToolOutput { .. } => Some(index),
+                TranscriptEntry::ToolOutput { .. }
+                | TranscriptEntry::Thinking { done: true, .. } => Some(index),
                 _ => None,
             })
     }
@@ -460,7 +569,8 @@ impl TranscriptState {
             .enumerate()
             .skip(current + 1)
             .find_map(|(index, entry)| match entry {
-                TranscriptEntry::ToolOutput { .. } => Some(index),
+                TranscriptEntry::ToolOutput { .. }
+                | TranscriptEntry::Thinking { done: true, .. } => Some(index),
                 _ => None,
             })
     }
@@ -472,7 +582,8 @@ impl TranscriptState {
             .take(current)
             .rev()
             .find_map(|(index, entry)| match entry {
-                TranscriptEntry::ToolOutput { .. } => Some(index),
+                TranscriptEntry::ToolOutput { .. }
+                | TranscriptEntry::Thinking { done: true, .. } => Some(index),
                 _ => None,
             })
     }

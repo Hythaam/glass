@@ -237,6 +237,13 @@ impl SessionContext {
         }
     }
 
+    pub fn reset(&mut self) {
+        self.summary = None;
+        self.recent_turns.clear();
+        self.tool_observations.clear();
+        self.next_sequence = 0;
+    }
+
     pub fn push_user(&mut self, content: &str) {
         self.push_turn(
             TurnRole::User,
@@ -273,11 +280,7 @@ impl SessionContext {
             TurnRole::Assistant,
             "",
             tool_calls.clone(),
-            TokenUsage::estimated_only(estimate_turn_tokens(
-                TurnRole::Assistant,
-                "",
-                &tool_calls,
-            )),
+            TokenUsage::estimated_only(estimate_turn_tokens(TurnRole::Assistant, "", &tool_calls)),
         );
         Ok(())
     }
@@ -804,6 +807,26 @@ mod tests {
                 .content
                 .starts_with("Conversation summary:\n")
         );
+    }
+
+    #[test]
+    fn reset_clears_history_but_preserves_configuration() {
+        let mut context = SessionContext::new(20, Some("Follow repo conventions.".into()));
+        context.push_user("hello glass");
+        context.push_assistant("hi there");
+        context.push_tool_output("fs", "src/main.rs");
+        context.prune_if_needed();
+
+        context.reset();
+
+        assert_eq!(context.limit(), 20);
+        let request = context.chat_request().unwrap();
+        assert_eq!(request.messages.len(), 1);
+        assert_eq!(request.messages[0].role, ChatRole::System);
+        assert_eq!(request.messages[0].content, "Follow repo conventions.");
+        assert!(context.summary().is_none());
+        assert!(context.recent_turns().is_empty());
+        assert!(context.tool_observations().is_empty());
     }
 
     #[test]

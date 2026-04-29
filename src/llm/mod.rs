@@ -9,6 +9,7 @@ use std::fmt;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderStreamItem {
+    ThinkingDelta(String),
     AssistantDelta(String),
     ToolCall(ToolCall),
     Done { usage: Option<RequestTokenUsage> },
