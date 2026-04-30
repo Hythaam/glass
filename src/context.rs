@@ -296,11 +296,6 @@ impl SessionContext {
             )),
             sequence,
         });
-        // Enforce recent-only raw retention: compact older tool outputs immediately
-        // so only the most recent RAW_TOOL_WINDOW remain as full raw bodies.
-        // compact_old_tool_outputs() is safe to call repeatedly and is intentionally
-        // idempotent for already-compacted entries.
-        self.compact_old_tool_outputs();
     }
 
     pub fn prune_if_needed(&mut self) {
@@ -607,8 +602,31 @@ mod tests {
     }
 
     #[test]
-    fn compacts_older_tool_outputs_but_keeps_recent_raw_bodies() {
+    fn keeps_inserted_tool_outputs_raw_until_pruning_starts() {
         let mut context = new_context(1000);
+        context.push_tool_output("t1", "alpha\nbeta\ngamma\ndelta\nepsilon\nzeta");
+        context.push_tool_output("t2", "middle\ncontent");
+        context.push_tool_output("t3", "recent\nraw\noutput");
+
+        assert_eq!(context.tool_observations().len(), 3);
+        assert!(
+            context
+                .tool_observations()
+                .iter()
+                .all(|observation| !observation.is_compacted()),
+            "tool outputs should remain raw before prune_if_needed()"
+        );
+        assert_eq!(
+            context.tool_observations()[0].body(),
+            "alpha\nbeta\ngamma\ndelta\nepsilon\nzeta"
+        );
+        assert_eq!(context.tool_observations()[1].body(), "middle\ncontent");
+        assert_eq!(context.tool_observations()[2].body(), "recent\nraw\noutput");
+    }
+
+    #[test]
+    fn compacts_older_tool_outputs_but_keeps_recent_raw_bodies_once_pruning_starts() {
+        let mut context = new_context(80);
         context.push_tool_output("t1", "alpha\nbeta\ngamma\ndelta\nepsilon\nzeta");
         context.push_tool_output("t2", "middle\ncontent");
         context.push_tool_output("t3", "recent\nraw\noutput");
