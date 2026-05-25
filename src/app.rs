@@ -2,7 +2,7 @@ use std::env;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use cliclack::{Input, intro, outro_cancel};
+use cliclack::{Input, intro, outro, outro_cancel, spinner, termwrap};
 
 use crate::chat::ChatClient;
 use crate::cli::Cli;
@@ -20,12 +20,9 @@ pub async fn run() -> Result<()> {
         return Ok(());
     }
 
-    intro("glass")?;
+    intro("Glass")?;
     loop {
-        let prompt: String = Input::new("Prompt")
-            .multiline()
-            .required(false)
-            .interact()?;
+        let prompt: String = Input::new("User").multiline().required(false).interact()?;
 
         let trimmed = prompt.trim();
         if trimmed.is_empty() {
@@ -44,9 +41,40 @@ async fn run_round(session: &Session, chat: &ChatClient, prompt: String) -> Resu
 
     let events = session.load_events()?;
     let messages = build_chat_messages(&events);
-    let assistant_output = chat.stream_chat_completion(messages).await?;
+    let progress = spinner();
+    progress.start("Assistant is thinking...");
+
+    let assistant_output = match chat
+        .stream_chat_completion(messages, |output| {
+            progress.set_message(&preview_message(output));
+            Ok(())
+        })
+        .await
+    {
+        Ok(output) => {
+            progress.stop("Assistant");
+            outro(&output);
+            output
+        }
+        Err(error) => {
+            progress.error("Assistant response failed");
+            return Err(error);
+        }
+    };
 
     let assistant_event = SessionEvent::assistant_message(sequence + 1, assistant_output);
     session.append_event(&assistant_event)?;
     Ok(())
+}
+
+fn preview_message(message: &str) -> String {
+    let mut chars = message.chars();
+    let preview: String = chars.by_ref().collect();
+    let preview: String = (&preview[(preview.len() - 50)..]).into();
+
+    if chars.next().is_some() {
+        format!("{preview}...")
+    } else {
+        preview
+    }
 }

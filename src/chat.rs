@@ -1,5 +1,4 @@
 use std::env;
-use std::io::{self, Write};
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_openai::{Client, config::OpenAIConfig};
@@ -31,7 +30,14 @@ impl ChatClient {
         })
     }
 
-    pub async fn stream_chat_completion(&self, messages: Vec<Value>) -> Result<String> {
+    pub async fn stream_chat_completion<F>(
+        &self,
+        messages: Vec<Value>,
+        mut on_delta: F,
+    ) -> Result<String>
+    where
+        F: FnMut(&str) -> Result<()>,
+    {
         if messages.is_empty() {
             bail!("cannot create a chat request with no context messages");
         }
@@ -57,9 +63,8 @@ impl ChatClient {
                 .as_str()
                 .unwrap_or_default();
             if !delta.is_empty() {
-                print!("{delta}");
-                io::stdout().flush().context("failed to flush stdout")?;
                 output.push_str(delta);
+                on_delta(&output)?;
             }
         }
 
@@ -67,7 +72,6 @@ impl ChatClient {
             return Err(anyhow!("model response was empty"));
         }
 
-        println!();
         Ok(output)
     }
 }
